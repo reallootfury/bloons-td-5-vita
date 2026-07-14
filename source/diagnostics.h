@@ -1,0 +1,32 @@
+#ifndef BTD5_DIAGNOSTICS_H
+#define BTD5_DIAGNOSTICS_H
+
+typedef enum BTD5TickStage {
+    BTD5_STAGE_BOOT = 0,
+    BTD5_STAGE_TICK_ENTER,
+    BTD5_STAGE_UPDATE,
+    BTD5_STAGE_UPDATE_RETURNED,
+    BTD5_STAGE_EGL_SWAP,
+    BTD5_STAGE_EGL_SWAP_RETURNED,
+    BTD5_STAGE_PRESENT_RETURNED,
+    BTD5_STAGE_RENDER_CORE_RETURNED,
+    BTD5_STAGE_RENDER_OVERLAY,
+    BTD5_STAGE_RENDER_OVERLAY_RETURNED,
+    BTD5_STAGE_MUTEX_LOCK,
+    BTD5_STAGE_MUTEX_LOCK_RETURNED,
+    BTD5_STAGE_MUTEX_UNLOCK,
+    BTD5_STAGE_MUTEX_UNLOCK_RETURNED,
+    BTD5_STAGE_COND_WAIT,
+    BTD5_STAGE_COND_WAIT_RETURNED,
+    BTD5_STAGE_POST_FRAME,
+    BTD5_STAGE_POST_FRAME_RETURNED,
+    BTD5_STAGE_TICK_RETURNED,
+} BTD5TickStage;
+
+void btd5_diag_bind_current_thread(void);
+int btd5_diag_is_current_thread(void);
+void btd5_diag_set_stage(BTD5TickStage stage);
+BTD5TickStage btd5_diag_get_stage(void);
+const char *btd5_diag_stage_name(BTD5TickStage stage);
+
+#endif
