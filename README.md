@@ -34,15 +34,6 @@ ux0:data/btd5/
 └── libnative.so
 ```
 
-The script rejects a different APK by default. `BTD5_ALLOW_UNVERIFIED=1` is
-only for investigating another legally obtained build; it is not compatibility
-guarantee.
-
-`verify_target.sh` is a read-only preflight check: it validates the APK ZIP,
-the ARMv7 executable, all native import resolver entries, and the BTD5
-lifecycle exports this loader calls. It does not prove that the game runs on
-Vita; the console test and `loader.log` remain the runtime verification.
-
 ## Build
 
 Requires VitaSDK-softfp, VitaGL, and kubridge. The target Vita also needs
