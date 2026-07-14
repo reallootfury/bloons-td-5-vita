@@ -21,7 +21,7 @@ It is expected that v4.7 of Bloons TD 5 will be working soon. I am using a older
 ## Preparing user-owned data
 
 
-you are looking to grab the v3.37 of Bloons TD 5
+You are looking to grab the v3.37 of Bloons TD 5
 
 Do not mix this executable with another APK's assets or versions of Bloons TD 5
 
