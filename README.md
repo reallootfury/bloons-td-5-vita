@@ -1,4 +1,69 @@
-# bloons-td-5-vita
-a bloons td 5 port to the ps vita
+# Bloons TD 5 Vita Loader
 
-coming soon: expected in another 2 weeks from now
+An in-progress PlayStation Vita loader for the Android ARMv7 build of Bloons
+TD 5. It uses the Android-to-Vita `.so` loader approach: the game executable
+and assets are supplied by each user and are never included in this repository
+or its VPK.
+
+## Current scope
+
+The loader has a pinned target build, a Vita lifecycle bridge for BTD5's
+exported `MainActivity_native*` interface, Android asset-manager replacement,
+VitaGL/EGL support, and touch/key forwarding. Android-only storefront,
+advertising, cloud/social, and live-event services still need runtime stubs or
+
+This is a beta version of btd5, bugs are expected. The release of the beta is solely meant to help me find bugs that i cannot do on my own free time.
+
+It is expected that v4.7 of Bloons TD 5 will be working soon. I am using a older version to see if it would simply run.
+
+
+
+## Preparing user-owned data
+
+
+you are looking to grab the v3.37 of Bloons TD 5
+
+Do not mix this executable with another APK's assets or versions of Bloons TD 5
+
+Copy the resulting directory to `ux0:data/btd5/` on the Vita. It must contain:
+
+```
+ux0:data/btd5/
+├── assets/
+├── base.apk
+└── libnative.so
+```
+
+The script rejects a different APK by default. `BTD5_ALLOW_UNVERIFIED=1` is
+only for investigating another legally obtained build; it is not compatibility
+guarantee.
+
+`verify_target.sh` is a read-only preflight check: it validates the APK ZIP,
+the ARMv7 executable, all native import resolver entries, and the BTD5
+lifecycle exports this loader calls. It does not prove that the game runs on
+Vita; the console test and `loader.log` remain the runtime verification.
+
+## Build
+
+Requires VitaSDK-softfp, VitaGL, and kubridge. The target Vita also needs
+`kubridge.skprx` and `libshacccg.suprx`.
+
+```sh
+export VITASDK=/path/to/vitasdk-softfp
+export PATH="$VITASDK/bin:$PATH"
+./scripts/build-softfp-deps.sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+The resulting `build/btd5-vita.vpk` contains only the loader.
+
+For the first console test, build with `-DCMAKE_BUILD_TYPE=Debug`. The loader
+will write its startup and Android-log bridge output to
+`ux0:data/btd5/loader.log`; keep that file if it returns to the LiveArea or
+crashes.
+
+## Credits
+
+Built from [SoLoader Boilerplate](https://github.com/v-atamanenko/soloader-boilerplate).
+The architecture is informed by [Hill Climb Racing Vita](https://github.com/memory-hunter/hill-climb-racing-vita).
