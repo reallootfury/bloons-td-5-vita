@@ -32,7 +32,7 @@ endif()
 set(VITA_APP_NAME "Bloons TD 5")
 set(VITA_TITLEID "BTD500001")
 set(VITA_VPKNAME "btd5-vita")
-set(VITA_VERSION "01.22")
+set(VITA_VERSION "01.00")
 set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 
 # Optional: used for "send" and "dump" targets
