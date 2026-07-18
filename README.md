@@ -7,8 +7,7 @@ An unofficial PlayStation Vita loader for the Android ARMv7 release of
 
 ## Support
 
-If this port or the related Vita work is useful to you, you can
-[support future development on Buy Me a Coffee](https://buymeacoffee.com/lootfury).
+[Support this project and others coming up on Buy Me a Coffee](https://buymeacoffee.com/lootfury)
 
 > [!IMPORTANT]
 > This repository and its VPK do not contain the game executable, APK, or game
