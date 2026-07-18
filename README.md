@@ -7,7 +7,8 @@ An unofficial PlayStation Vita loader for the Android ARMv7 release of
 
 ## Support
 
-[Support this project and others coming up on Buy Me a Coffee](https://buymeacoffee.com/lootfury)
+If this port or the related Vita work is useful to you, you can
+[support future development on Buy Me a Coffee](https://buymeacoffee.com/lootfury).
 
 > [!IMPORTANT]
 > This repository and its VPK do not contain the game executable, APK, or game
@@ -53,7 +54,12 @@ An unofficial PlayStation Vita loader for the Android ARMv7 release of
 
 - [`kubridge.skprx`](https://github.com/bythos14/kubridge).
 - `libshacccg.suprx`, normally installed with
-  [ShaRKBR33D]((https://github.com/Rinnegatamante/ShaRKBR33D)).
+  [ShaRKBR33D](https://github.com/OsirizX/ShaRKBR33D).
+
+
+Each installed game version must retain its owned source APK under the exact
+name `base.apk`. For BTD5 4.7, use the APK containing the game assets as
+`base.apk`; obtain `libnative.so` from the separate ARMv7 APK when necessary.
 
 
 ### BTD5 3.37
@@ -66,9 +72,9 @@ b5f6f341bb9918333a5ecbdb5af4a6026beb58bab33986546673c3ab00993639
 
 Create `ux0:data/btd5/3.37/`, then:
 
-1. Open the owned APK as a ZIP archive and copy its complete `assets/`
-   directory into the `3.37/` folder.
-2. Extract `lib/armeabi-v7a/libnative.so` and place it directly inside the
+1. Copy the owned APK into the `3.37/` folder and name it `base.apk`.
+2. copy the complete `assets/` directory into the `3.37/` folder.
+3. Extract `lib/armeabi-v7a/libnative.so` and place it directly inside the
    `3.37/` folder as `libnative.so`.
 
 The loader verifies the extracted native executable before starting the game.
@@ -80,9 +86,10 @@ different installers and backup tools may vary.
 
 Create `ux0:data/btd5/4.7/`, then:
 
-1. Open the owned APK containing the game assets as a ZIP archive and copy its
-   complete `assets/` directory into the `4.7/` folder.
-2. From the owned ARMv7 APK containing the native library, extract
+1. Copy the owned APK containing the game assets into the `4.7/` folder and
+   name it `base.apk`.
+2. copy its complete `assets/` directory into the `4.7/` folder.
+3. From the owned ARMv7 APK containing the native library, extract
    `lib/armeabi-v7a/libnative.so` and place it directly inside the `4.7/`
    folder as `libnative.so`.
 
@@ -96,9 +103,11 @@ Install either version folder or both:
 ux0:data/btd5/
 ├── 3.37/
 │   ├── assets/
+│   ├── base.apk
 │   └── libnative.so
 └── 4.7/
     ├── assets/
+    ├── base.apk
     └── libnative.so
 ```
 
