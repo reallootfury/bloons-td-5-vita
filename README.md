@@ -73,7 +73,7 @@ b5f6f341bb9918333a5ecbdb5af4a6026beb58bab33986546673c3ab00993639
 Create `ux0:data/btd5/3.37/`, then:
 
 1. Copy the owned APK into the `3.37/` folder and name it `base.apk`.
-2. copy the complete `assets/` directory into the `3.37/` folder.
+2. Copy the complete `assets/` directory into the `3.37/` folder.
 3. Extract `lib/armeabi-v7a/libnative.so` and place it directly inside the
    `3.37/` folder as `libnative.so`.
 
@@ -88,7 +88,7 @@ Create `ux0:data/btd5/4.7/`, then:
 
 1. Copy the owned APK containing the game assets into the `4.7/` folder and
    name it `base.apk`.
-2. copy its complete `assets/` directory into the `4.7/` folder.
+2. Copy its complete `assets/` directory into the `4.7/` folder.
 3. From the owned ARMv7 APK containing the native library, extract
    `lib/armeabi-v7a/libnative.so` and place it directly inside the `4.7/`
    folder as `libnative.so`.
