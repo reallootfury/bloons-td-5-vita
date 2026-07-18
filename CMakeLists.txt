@@ -6,26 +6,26 @@ endif ()
 
 set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "Toolchain file")
 
-project(so_loader C CXX)
+project(btd5_vita C CXX)
 
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
 # Android ARMv7 binaries use the soft-float procedure-call ABI.  VitaSDK's
 # packaged OpenSLES and zlib archives are hard-float, so build these two
-# dependencies locally with scripts/build-softfp-deps.sh before configuring.
+# dependencies locally with scripts/build_softfp_deps.py before configuring.
 set(SOFTFP_DEPS_DIR "${CMAKE_SOURCE_DIR}/.deps-softfp" CACHE PATH
     "Directory containing soft-float dependency archives")
 foreach(SOFTFP_ARCHIVE libOpenSLES.a libz.a)
   if(NOT EXISTS "${SOFTFP_DEPS_DIR}/${SOFTFP_ARCHIVE}")
     message(FATAL_ERROR
       "Missing ${SOFTFP_DEPS_DIR}/${SOFTFP_ARCHIVE}. "
-      "Run scripts/build-softfp-deps.sh before configuring this project.")
+      "Run python3 scripts/build_softfp_deps.py before configuring this project.")
   endif()
 endforeach()
 if(NOT EXISTS "${CMAKE_SOURCE_DIR}/.deps-src/minimp3/minimp3_ex.h")
   message(FATAL_ERROR
     "Missing .deps-src/minimp3/minimp3_ex.h. "
-    "Run scripts/build-softfp-deps.sh before configuring this project.")
+    "Run python3 scripts/build_softfp_deps.py before configuring this project.")
 endif()
 
 # Vita application configuration
@@ -33,10 +33,10 @@ set(VITA_APP_NAME "Bloons TD 5")
 set(VITA_TITLEID "BTD500001")
 set(VITA_VPKNAME "btd5-vita")
 set(VITA_VERSION "01.00")
-set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
+set(VITA_RELEASE_VERSION "1.00")
 
 # Optional: used for "send" and "dump" targets
-set(PSVITAIP "192.168.0.198" CACHE STRING "PSVita IP (for FTP access)")
+set(PSVITAIP "$ENV{PSVITAIP}" CACHE STRING "PS Vita IP address (for FTP access)")
 set(PARSECOREPATH "$ENV{PARSECOREPATH}" CACHE STRING "vita-parse-core main.py")
 
 # Game-specific definitions.  Migrate caches created from the SoLoader
@@ -48,13 +48,9 @@ endif()
 if (SO_PATH STREQUAL "ux0:data/gamename/main.so")
   unset(SO_PATH CACHE)
 endif()
-if (APK_PATH STREQUAL "ux0:data/gamename/base.apk")
-  unset(APK_PATH CACHE)
-endif()
 set(DATA_PATH "ux0:data/btd5/" CACHE STRING "Path to user-supplied game data (with trailing /)")
 set(SO_PATH "${DATA_PATH}libnative.so" CACHE STRING "Path to the Android ARMv7 executable")
-set(APK_PATH "${DATA_PATH}base.apk" CACHE STRING "Path to the user-supplied APK")
-add_definitions(-DDATA_PATH="${DATA_PATH}" -DSO_PATH="${SO_PATH}" -DAPK_PATH="${APK_PATH}")
+add_definitions(-DDATA_PATH="${DATA_PATH}" -DSO_PATH="${SO_PATH}")
 
 option(USE_SCELIBC_IO "Use SceLibcBridge for IO and some other std functions" ON)
 if (USE_SCELIBC_IO)
@@ -96,6 +92,7 @@ endif()
 
 # makes sincos, sincosf, etc. visible
 add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
+add_definitions(-DBTD5_RUNTIME_LOGGING)
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -mfloat-abi=softfp -std=gnu11 -Wno-deprecated")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wl,-q -mfloat-abi=softfp -std=gnu++20 -Wno-write-strings -Wno-psabi")
@@ -110,6 +107,7 @@ endif()
 
 add_executable(${CMAKE_PROJECT_NAME}
                source/diagnostics.c
+               source/game.c
                source/music.c
                source/main.c
                source/dynlib.c
@@ -119,6 +117,8 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/reimpl/bionic.c
                source/reimpl/controls.c
                source/reimpl/controls.h
+               source/reimpl/ui_context.c
+               source/reimpl/ui_context.h
                source/reimpl/egl.c
                source/reimpl/errno.c
                source/reimpl/io.c
@@ -183,6 +183,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
                       SceCommonDialog_stub
                       SceDisplay_stub
                       SceKernelDmacMgr_stub
+                      SceSysmem_stub
                       SceFios2_stub
                       SceCtrl_stub
                       SceGxm_stub
@@ -197,11 +198,12 @@ target_link_options(${CMAKE_PROJECT_NAME} PRIVATE -Wl,--allow-multiple-definitio
 
 vita_create_self(eboot.bin ${CMAKE_PROJECT_NAME} UNSAFE NOASLR)
 
-# vita_create_vpk() expands asset paths into one shell command and fails when
-# the source directory contains spaces. Keep the VPK creation explicit and
-# VERBATIM so this workspace ("bloons td 5") builds normally too.
+# Keep VPK creation explicit and VERBATIM so every asset path is safely quoted.
 set(BTD5_SFO "${CMAKE_CURRENT_BINARY_DIR}/${VITA_VPKNAME}.sfo")
-set(BTD5_VPK "${CMAKE_CURRENT_BINARY_DIR}/${VITA_VPKNAME}.vpk")
+set(BTD5_VPK_NOLOG
+    "${CMAKE_CURRENT_BINARY_DIR}/${VITA_VPKNAME}-v${VITA_RELEASE_VERSION}.vpk")
+set(BTD5_VPK_LOGGING
+    "${CMAKE_CURRENT_BINARY_DIR}/${VITA_VPKNAME}-v${VITA_RELEASE_VERSION}-logging.vpk")
 add_custom_command(
     OUTPUT "${BTD5_SFO}"
     COMMAND "${VITASDK}/bin/vita-mksfoex"
@@ -211,31 +213,40 @@ add_custom_command(
             "${VITA_APP_NAME}" "${BTD5_SFO}"
     DEPENDS eboot.bin
     VERBATIM)
-add_custom_command(
-    OUTPUT "${BTD5_VPK}"
-    COMMAND "${VITASDK}/bin/vita-pack-vpk"
-            -s "${BTD5_SFO}"
-            -b "${CMAKE_CURRENT_BINARY_DIR}/eboot.bin"
-            -a "${CMAKE_SOURCE_DIR}/extras/cpuinfo=cpuinfo"
-            -a "${CMAKE_SOURCE_DIR}/extras/meminfo=meminfo"
-            -a "${CMAKE_SOURCE_DIR}/extras/urandom=urandom"
-            -a "${CMAKE_SOURCE_DIR}/extras/livearea/icon0.png=sce_sys/icon0.png"
-            -a "${CMAKE_SOURCE_DIR}/extras/livearea/pic0.png=sce_sys/pic0.png"
-            -a "${CMAKE_SOURCE_DIR}/extras/livearea/startup.png=sce_sys/livearea/contents/startup.png"
-            -a "${CMAKE_SOURCE_DIR}/extras/livearea/bg0.png=sce_sys/livearea/contents/bg0.png"
-            -a "${CMAKE_SOURCE_DIR}/extras/livearea/template.xml=sce_sys/livearea/contents/template.xml"
-            "${BTD5_VPK}"
-    DEPENDS "${BTD5_SFO}" eboot.bin
-            "${CMAKE_SOURCE_DIR}/extras/cpuinfo"
-            "${CMAKE_SOURCE_DIR}/extras/meminfo"
-            "${CMAKE_SOURCE_DIR}/extras/urandom"
-            "${CMAKE_SOURCE_DIR}/extras/livearea/icon0.png"
-            "${CMAKE_SOURCE_DIR}/extras/livearea/pic0.png"
-            "${CMAKE_SOURCE_DIR}/extras/livearea/startup.png"
-            "${CMAKE_SOURCE_DIR}/extras/livearea/bg0.png"
-            "${CMAKE_SOURCE_DIR}/extras/livearea/template.xml"
-    VERBATIM)
-add_custom_target(${VITA_VPKNAME}_vpk ALL DEPENDS "${BTD5_VPK}")
+
+function(add_btd5_vpk OUTPUT_PATH LOG_CONFIG)
+  add_custom_command(
+      OUTPUT "${OUTPUT_PATH}"
+      COMMAND "${VITASDK}/bin/vita-pack-vpk"
+              -s "${BTD5_SFO}"
+              -b "${CMAKE_CURRENT_BINARY_DIR}/eboot.bin"
+              -a "${CMAKE_SOURCE_DIR}/extras/cpuinfo=cpuinfo"
+              -a "${CMAKE_SOURCE_DIR}/extras/meminfo=meminfo"
+              -a "${CMAKE_SOURCE_DIR}/extras/urandom=urandom"
+              -a "${CMAKE_SOURCE_DIR}/${LOG_CONFIG}=loader_logging.cfg"
+              -a "${CMAKE_SOURCE_DIR}/extras/livearea/icon0.png=sce_sys/icon0.png"
+              -a "${CMAKE_SOURCE_DIR}/extras/livearea/pic0.png=sce_sys/pic0.png"
+              -a "${CMAKE_SOURCE_DIR}/extras/livearea/startup.png=sce_sys/livearea/contents/startup.png"
+              -a "${CMAKE_SOURCE_DIR}/extras/livearea/bg0.png=sce_sys/livearea/contents/bg0.png"
+              -a "${CMAKE_SOURCE_DIR}/extras/livearea/template.xml=sce_sys/livearea/contents/template.xml"
+              "${OUTPUT_PATH}"
+      DEPENDS "${BTD5_SFO}" eboot.bin
+              "${CMAKE_SOURCE_DIR}/extras/cpuinfo"
+              "${CMAKE_SOURCE_DIR}/extras/meminfo"
+              "${CMAKE_SOURCE_DIR}/extras/urandom"
+              "${CMAKE_SOURCE_DIR}/${LOG_CONFIG}"
+              "${CMAKE_SOURCE_DIR}/extras/livearea/icon0.png"
+              "${CMAKE_SOURCE_DIR}/extras/livearea/pic0.png"
+              "${CMAKE_SOURCE_DIR}/extras/livearea/startup.png"
+              "${CMAKE_SOURCE_DIR}/extras/livearea/bg0.png"
+              "${CMAKE_SOURCE_DIR}/extras/livearea/template.xml"
+      VERBATIM)
+endfunction()
+
+add_btd5_vpk("${BTD5_VPK_NOLOG}" "extras/config/loader-log-off.cfg")
+add_btd5_vpk("${BTD5_VPK_LOGGING}" "extras/config/loader-log-on.cfg")
+add_custom_target(${VITA_VPKNAME}_vpk ALL
+                  DEPENDS "${BTD5_VPK_NOLOG}" "${BTD5_VPK_LOGGING}")
 add_dependencies(${VITA_VPKNAME}_vpk eboot.bin-self)
 
 add_custom_target(send
@@ -254,7 +265,7 @@ add_custom_target(send_kvdb
                   )
 
 add_custom_target(dump
-                  COMMAND ${CMAKE_SOURCE_DIR}/extras/scripts/get_dump.sh ${PSVITAIP}
+                  COMMAND python3 ${CMAKE_SOURCE_DIR}/extras/scripts/get_dump.py ${PSVITAIP}
                   COMMAND python3 ${PARSECOREPATH} coredump ${CMAKE_PROJECT_NAME}
                   )
 
