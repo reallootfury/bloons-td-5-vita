@@ -1,0 +1,387 @@
+diff --git a/libopensles/IBufferQueue.c b/libopensles/IBufferQueue.c
+index baf95fe..caa23c5 100644
+--- a/libopensles/IBufferQueue.c
++++ b/libopensles/IBufferQueue.c
+@@ -18,6 +18,12 @@
+ 
+ #include "sles_allinclusive.h"
+ 
++volatile uint32_t opensles_vita_enqueue_count;
++volatile uint32_t opensles_vita_enqueue_failures;
++volatile uint32_t opensles_vita_last_source_rate;
++volatile uint32_t opensles_vita_last_source_channels;
++volatile uint32_t opensles_vita_last_source_bits;
++
+ 
+ /** Determine the state of the audio player or audio recorder associated with a buffer queue.
+  *  Note that PLAYSTATE and RECORDSTATE values are equivalent (where PLAYING == RECORDING).
+@@ -70,78 +76,92 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
+             newRear = this->mArray;
+         }
+         if (newRear == this->mFront) {
++            ++opensles_vita_enqueue_failures;
+             result = SL_RESULT_BUFFER_INSUFFICIENT;
+         } else {
+-            int num_cycles = (&_opensles_user_freq!=NULL?_opensles_user_freq:44100) * 1000 / this->samplerate;
+-            int multiplier = 1;
++            const uint32_t output_rate =
++                (&_opensles_user_freq != NULL && _opensles_user_freq > 0)
++                    ? (uint32_t)_opensles_user_freq * 1000U
++                    : SL_SAMPLINGRATE_44_1;
++            const uint32_t input_rate = this->samplerate;
++            const uint32_t channels = this->channels;
++            const uint32_t bits = this->bps;
++            const uint32_t bytes_per_sample = bits / 8U;
++            const uint32_t input_frame_size = channels * bytes_per_sample;
+             void *ownedBuffer = NULL;
+-            if (this->channels == 1)
+-                multiplier *= 2;
+-            if (this->bps == 8)
+-                multiplier *= 2;
+-            if (num_cycles != 1 || this->channels == 1 || this->bps == 8) {
+-                ownedBuffer = calloc(1, size * num_cycles * multiplier);
++
++            if (input_rate == 0 || (channels != 1 && channels != 2) ||
++                    (bits != 8 && bits != 16) || input_frame_size == 0 ||
++                    size % input_frame_size != 0) {
++                ++opensles_vita_enqueue_failures;
++                interface_unlock_exclusive(this);
++                result = SL_RESULT_CONTENT_UNSUPPORTED;
++                goto fail;
++            }
++
++            const uint32_t input_frames = size / input_frame_size;
++            const uint64_t output_frames_64 =
++                ((uint64_t)input_frames * output_rate + input_rate - 1U) /
++                input_rate;
++            if (output_frames_64 == 0 || output_frames_64 > UINT32_MAX / 4U) {
++                ++opensles_vita_enqueue_failures;
++                interface_unlock_exclusive(this);
++                result = SL_RESULT_MEMORY_FAILURE;
++                goto fail;
++            }
++            const uint32_t output_frames = (uint32_t)output_frames_64;
++            const uint32_t output_size = output_frames * 4U;
++
++            if (input_rate != output_rate || channels != 2 || bits != 16) {
++                ownedBuffer = malloc(output_size);
+                 if (NULL == ownedBuffer) {
++                    ++opensles_vita_enqueue_failures;
+                     interface_unlock_exclusive(this);
+                     result = SL_RESULT_RESOURCE_ERROR;
+                     goto fail;
+                 }
+-                if (this->bps != 8) {
+-                    if (this->channels == 2) { // PCM16 Stereo
+-                        uint32_t *src = (uint32_t *)pBuffer;
+-                        uint32_t *dst = (uint32_t *)ownedBuffer;
+-                        for (int j = 0; j < size; j += 4) {
+-                            for (int i = 0; i < num_cycles; i++) {
+-                                dst[i] = *src;
+-                            }
+-                            src++;
+-                            dst += num_cycles;
+-                        }
+-                    } else { // PCM16 Mono
+-                        uint16_t *src = (uint16_t *)pBuffer;
+-                        uint16_t *dst = (uint16_t *)ownedBuffer;
+-                        for (int j = 0; j < size; j += 2) {
+-                            for (int i = 0; i < num_cycles; i++) {
+-                                dst[i*2] = *src;
+-                                dst[i*2+1] = *src;
+-                            }
+-                            src++;
+-                            dst += num_cycles * 2;
+-                        }
++
++                int16_t *dst = (int16_t *)ownedBuffer;
++                uint32_t source_frame = 0;
++                uint32_t source_phase = 0;
++                for (uint32_t frame = 0; frame < output_frames; ++frame) {
++                    int16_t left;
++                    int16_t right;
++                    if (bits == 16) {
++                        const int16_t *src = (const int16_t *)pBuffer +
++                                             source_frame * channels;
++                        left = src[0];
++                        right = channels == 2 ? src[1] : left;
++                    } else {
++                        const uint8_t *src = (const uint8_t *)pBuffer +
++                                             source_frame * channels;
++                        left = (int16_t)(((int32_t)src[0] - 0x80) << 8);
++                        right = channels == 2
++                            ? (int16_t)(((int32_t)src[1] - 0x80) << 8)
++                            : left;
+                     }
+-                } else {
+-                    if (this->channels == 2) { // PCM8 Stereo
+-                        uint8_t *src = (uint8_t *)pBuffer;
+-                        int16_t *dst = (int16_t *)ownedBuffer;
+-                        for (int j = 0; j < size; j += 2) {
+-                            for (int i = 0; i < num_cycles; i++) {
+-                                dst[i*2] = ((int16_t)src[0] - 0x80) << 8;
+-                                dst[i*2+1] = ((int16_t)src[1] - 0x80) << 8;
+-                            }
+-                            src += 2;
+-                            dst += num_cycles * 2;
+-                        }
+-                    } else { // PCM8 Mono
+-                        uint8_t *src = (uint8_t *)pBuffer;
+-                        int16_t *dst = (int16_t *)ownedBuffer;
+-                        for (int j = 0; j < size; j++) {
+-                            for (int i = 0; i < num_cycles; i++) {
+-                                dst[i*2] = ((int16_t)*src - 0x80) << 8;
+-                                dst[i*2+1] = ((int16_t)*src - 0x80) << 8;
+-                            }
+-                            src++;
+-                            dst += num_cycles * 2;
+-                        }
++                    dst[frame * 2U] = left;
++                    dst[frame * 2U + 1U] = right;
++
++                    source_phase += input_rate;
++                    while (source_phase >= output_rate &&
++                           source_frame + 1U < input_frames) {
++                        source_phase -= output_rate;
++                        ++source_frame;
+                     }
+                 }
+                 pBuffer = ownedBuffer;
+             }
+             assert(NULL == oldRear->mOwnedBuffer);
+             oldRear->mBuffer = pBuffer;
+-            oldRear->mSize = size * num_cycles * multiplier;
++            oldRear->mSize = output_size;
+             oldRear->mOwnedBuffer = ownedBuffer;
+             this->mRear = newRear;
+             ++this->mState.count;
++            opensles_vita_last_source_rate = input_rate;
++            opensles_vita_last_source_channels = channels;
++            opensles_vita_last_source_bits = bits;
++            ++opensles_vita_enqueue_count;
+             if (SL_OBJECTID_AUDIOPLAYER == InterfaceToObjectID(this)) {
+                 CAudioPlayer *audioPlayer = (CAudioPlayer *) this->mThis;
+                 audioPlayer->mPlay.mHeadAtEnd = SL_BOOLEAN_FALSE;
+@@ -184,12 +204,21 @@ SLresult IBufferQueue_Clear(SLBufferQueueItf self)
+ #endif
+ 
+ #ifdef USE_OUTPUTMIXEXT
+-    // mixer might be reading from the front buffer, so tread carefully here
+-    // NTH asynchronous cancel instead of blocking until mixer acknowledges
+-    this->mClearRequested = SL_BOOLEAN_TRUE;
+-    do {
+-        interface_cond_wait(this);
+-    } while (this->mClearRequested);
++    if (this->mFront == this->mRear) {
++        // A completion callback can Clear the drained queue on the mixer thread.
++        // Waiting for that same mixer to acknowledge an empty Clear deadlocks it.
++        this->mFront = &this->mArray[0];
++        this->mRear = &this->mArray[0];
++        this->mState.count = 0;
++        this->mState.playIndex = 0;
++    } else {
++        // mixer might be reading from the front buffer, so tread carefully here
++        // NTH asynchronous cancel instead of blocking until mixer acknowledges
++        this->mClearRequested = SL_BOOLEAN_TRUE;
++        do {
++            interface_cond_wait(this);
++        } while (this->mClearRequested);
++    }
+ #endif
+ 
+     interface_unlock_exclusive(this);
+diff --git a/libopensles/IOutputMixExt.c b/libopensles/IOutputMixExt.c
+index 7941cdd..b4fa42a 100644
+--- a/libopensles/IOutputMixExt.c
++++ b/libopensles/IOutputMixExt.c
+@@ -19,6 +19,9 @@
+ #include "sles_allinclusive.h"
+ #include <math.h>
+ 
++volatile uint32_t opensles_vita_player_count;
++volatile uint32_t opensles_vita_player_failures;
++
+ 
+ // OutputMixExt is used by SDL, but is not specific to or dependent on SDL
+ 
+@@ -110,7 +113,7 @@ static SLboolean track_check(Track *track)
+             COutputMix *outputMix = CAudioPlayer_GetOutputMix(audioPlayer);
+             unsigned i = track - outputMix->mOutputMixExt.mTracks;
+             assert( /* 0 <= i && */ i < MAX_TRACK);
+-            unsigned mask = 1 << i;
++            uint64_t mask = UINT64_C(1) << i;
+             track->mAudioPlayer = NULL;
+             assert(outputMix->mOutputMixExt.mActiveMask & mask);
+             outputMix->mOutputMixExt.mActiveMask &= ~mask;
+@@ -251,7 +254,7 @@ void IOutputMixExt_FillBuffer(SLOutputMixExtItf self, void *pBuffer, SLuint32 si
+     }
+     outputMixSummaries[0] = summarize_gain(outputMixGains[0]);
+     outputMixSummaries[1] = summarize_gain(outputMixGains[1]);
+-    unsigned activeMask;
++    uint64_t activeMask;
+     // If the output mix is marked for destruction, then acknowledge the request
+     if (this->mDestroyRequested) {
+         IEngine *thisEngine = thisObject->mEngine;
+@@ -268,9 +271,9 @@ void IOutputMixExt_FillBuffer(SLOutputMixExtItf self, void *pBuffer, SLuint32 si
+         activeMask = this->mActiveMask;
+     }
+     while (activeMask) {
+-        unsigned i = ctz(activeMask);
++        unsigned i = (unsigned)__builtin_ctzll(activeMask);
+         assert(MAX_TRACK > i);
+-        activeMask &= ~(1 << i);
++        activeMask &= ~(UINT64_C(1) << i);
+         Track *track = &this->mTracks[i];
+ 
+         // track is allocated
+@@ -465,15 +468,17 @@ SLresult IOutputMixExt_checkAudioPlayerSourceSink(CAudioPlayer *this)
+             pAudioSnk->pLocator)->outputMix)->mOutputMixExt;
+         // allocate an entry within OutputMix for this track
+         interface_lock_exclusive(omExt);
+-        unsigned availMask = ~omExt->mActiveMask;
++        uint64_t availMask = ~omExt->mActiveMask;
+         if (!availMask) {
++            ++opensles_vita_player_failures;
+             interface_unlock_exclusive(omExt);
+             // All track slots full in output mix
+             return SL_RESULT_MEMORY_FAILURE;
+         }
+-        unsigned i = ctz(availMask);
++        unsigned i = (unsigned)__builtin_ctzll(availMask);
+         assert(MAX_TRACK > i);
+-        omExt->mActiveMask |= 1 << i;
++        omExt->mActiveMask |= UINT64_C(1) << i;
++        ++opensles_vita_player_count;
+         track = &omExt->mTracks[i];
+         track->mAudioPlayer = NULL;    // only field that is accessed before full initialization
+         interface_unlock_exclusive(omExt);
+diff --git a/libopensles/Vita.c b/libopensles/Vita.c
+index caa1a40..07fee4e 100644
+--- a/libopensles/Vita.c
++++ b/libopensles/Vita.c
+@@ -25,6 +25,15 @@ static IEngine *slEngine;
+ static volatile int audio_shutdown_requested;
+ static volatile int audio_thread_running;
+ static int audio_port = -1;
++static uint32_t audio_enqueue_baseline;
++
++volatile uint32_t opensles_vita_output_buffers;
++volatile uint32_t opensles_vita_nonzero_buffers;
++volatile uint32_t opensles_vita_output_completions;
++volatile uint32_t opensles_vita_waited_for_enqueue;
++volatile int32_t opensles_vita_output_error;
++
++extern volatile uint32_t opensles_vita_enqueue_count;
+ 
+ #ifdef HAVE_PTHREAD
+ static pthread_t audio_thread_handle;
+@@ -65,6 +74,15 @@ static void fill_output_buffer(uint8_t *stream, SLuint32 size) {
+ 		SLOutputMixExtItf OutputMixExt = &outputMix->mOutputMixExt.mItf;
+ 		IOutputMixExt_FillBuffer(OutputMixExt, stream, size);
+ 	}
++
++	++opensles_vita_output_buffers;
++	const uint32_t *samples = (const uint32_t *)stream;
++	for (SLuint32 offset = 0; offset < size / sizeof(*samples); ++offset) {
++		if (samples[offset] != 0) {
++			++opensles_vita_nonzero_buffers;
++			break;
++		}
++	}
+ }
+ 
+ #ifdef HAVE_PTHREAD
+@@ -77,10 +95,11 @@ static int audioThread(unsigned int args, void *arg) {
+ 	(void)args;
+ #endif
+ 
+-	int ch = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_BGM, SndFile_BUFSIZE / 4,
++	int ch = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_MAIN, SndFile_BUFSIZE / 4,
+ 															 opensles_output_freq(),
+ 															 SCE_AUDIO_OUT_MODE_STEREO);
+ 	if (ch < 0) {
++		opensles_vita_output_error = ch;
+ 		SL_LOGE("Unable to open Vita audio port: 0x%x", ch);
+ #ifdef HAVE_PTHREAD
+ 		return NULL;
+@@ -109,14 +128,33 @@ static int audioThread(unsigned int args, void *arg) {
+ 
+ 	while (!audio_shutdown_requested) {
+ 		uint8_t *stream = audio_buffers[buf_idx];
+-		buf_idx = (buf_idx + 1) % SndFile_NUMBUFS;
+ 
++		/* IOutputMixExt_FillBuffer is also the OpenSLES control pump.  It
++		 * acknowledges synchronous Clear/Destroy requests and broadcasts the
++		 * condition variables on which the game is waiting.  BTD5 4.7 creates
++		 * and destroys a probe player before its first queue submission, so the
++		 * mixer must run even while hardware output is intentionally gated. */
+ 		fill_output_buffer(stream, (SLuint32)SndFile_BUFSIZE);
++
++		/* The engine is created before its streaming buffer-queue player. On
++		 * Vita, submitting multiple empty MAIN buffers during that gap can leave
++		 * sceAudioOutOutput blocked before the game's first PCM buffer arrives.
++		 * Keep pumping OpenSLES control work above, but start the hardware stream
++		 * only after this engine instance receives real queue work. */
++		if (opensles_vita_enqueue_count == audio_enqueue_baseline) {
++			opensles_vita_waited_for_enqueue = 1;
++			sceKernelDelayThread(1000);
++			continue;
++		}
++		buf_idx = (buf_idx + 1) % SndFile_NUMBUFS;
++
+ 		res = sceAudioOutOutput(ch, stream);
+ 		if (res < 0) {
++			opensles_vita_output_error = res;
+ 			SL_LOGE("Vita audio output failed on port %d: 0x%x", ch, res);
+ 			break;
+ 		}
++		++opensles_vita_output_completions;
+ 	}
+ 
+ 	exit_thread:
+@@ -142,6 +180,7 @@ void SDL_open(IEngine *thisEngine)
+ 		return;
+ 	}
+ 	slEngine = thisEngine;
++	audio_enqueue_baseline = opensles_vita_enqueue_count;
+ 	audio_shutdown_requested = 0;
+ 	audio_thread_running = 0;
+ #ifdef HAVE_PTHREAD
+diff --git a/libopensles/sles_allinclusive.h b/libopensles/sles_allinclusive.h
+index 851a5ee..18a5a85 100644
+--- a/libopensles/sles_allinclusive.h
++++ b/libopensles/sles_allinclusive.h
+@@ -230,7 +230,7 @@ static inline void BufferHeader_release(BufferHeader *header)
+ 
+ #ifdef USE_SNDFILE
+ 
+-#define SndFile_BUFSIZE 512     // in 16-bit samples
++#define SndFile_BUFSIZE 2048    // larger Vita mix buffer; about 10.7 ms at 48 kHz stereo
+ #define SndFile_NUMBUFS 2
+ 
+ struct SndFile {
+@@ -687,7 +687,7 @@ typedef struct {
+     // fields that were formerly here are now at CAudioPlayer
+ } IMuteSolo;
+ 
+-#define MAX_TRACK 32        // see mActiveMask
++#define MAX_TRACK 64        // BTD5 loads more than 32 independent WAV effects
+ 
+ typedef struct {
+     const struct SLOutputMixItf_ *mItf;
+@@ -700,7 +700,7 @@ typedef struct {
+ typedef struct {
+     const struct SLOutputMixExtItf_ *mItf;
+     IObject *mThis;
+-    unsigned mActiveMask;   // 1 bit per active track
++    uint64_t mActiveMask;   // 1 bit per active track
+     Track mTracks[MAX_TRACK];
+     SLboolean mDestroyRequested;    ///< Mixer to acknowledge application's call to Object::Destroy
+ } IOutputMixExt;
+@@ -1364,4 +1364,4 @@ extern void ReleaseStrongRefAndUnlockExclusive(IObject *object);
+ 
+ extern COutputMix *CAudioPlayer_GetOutputMix(CAudioPlayer *audioPlayer);
+ 
+-extern int _opensles_user_freq __attribute__((weak));
+\ No newline at end of file
++extern int _opensles_user_freq __attribute__((weak));

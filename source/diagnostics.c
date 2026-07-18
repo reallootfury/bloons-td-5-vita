@@ -1,24 +1,24 @@
 #include "diagnostics.h"
 
-#include <psp2/kernel/threadmgr.h>
+#include <stdbool.h>
 #include <stdatomic.h>
 
 static atomic_int tick_stage = ATOMIC_VAR_INIT(BTD5_STAGE_BOOT);
-static atomic_int tick_thread = ATOMIC_VAR_INIT(-1);
+static atomic_bool tick_thread_bound = ATOMIC_VAR_INIT(false);
+static _Thread_local bool is_tick_thread = false;
 
 void btd5_diag_bind_current_thread(void) {
-    atomic_store_explicit(&tick_thread, sceKernelGetThreadId(),
-                          memory_order_release);
+    is_tick_thread = true;
+    atomic_store_explicit(&tick_thread_bound, true, memory_order_release);
 }
 
 int btd5_diag_is_current_thread(void) {
-    int owner = atomic_load_explicit(&tick_thread, memory_order_acquire);
-    return owner >= 0 && sceKernelGetThreadId() == owner;
+    return is_tick_thread;
 }
 
 void btd5_diag_set_stage(BTD5TickStage stage) {
-    int owner = atomic_load_explicit(&tick_thread, memory_order_acquire);
-    if (owner >= 0 && sceKernelGetThreadId() != owner) {
+    if (atomic_load_explicit(&tick_thread_bound, memory_order_acquire) &&
+        !is_tick_thread) {
         return;
     }
     atomic_store_explicit(&tick_stage, (int)stage, memory_order_release);

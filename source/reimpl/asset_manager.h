@@ -140,6 +140,18 @@ off_t AAsset_getLength(AAsset* asset);
  */
 int AAsset_openFileDescriptor(AAsset* asset, off_t* outStart, off_t* outLength);
 
+typedef struct AAssetDiagnostics {
+    unsigned long long opens;
+    unsigned long long active;
+    unsigned long long reads;
+    unsigned long long bytes;
+    unsigned long long seeks;
+    unsigned long long last_position;
+    unsigned long long last_size;
+} AAssetDiagnostics;
+
+void AAsset_getDiagnostics(AAssetDiagnostics *diagnostics);
+
 #ifdef __cplusplus
 };
 #endif

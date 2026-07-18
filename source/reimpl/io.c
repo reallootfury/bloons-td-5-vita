@@ -10,6 +10,9 @@
 #include "reimpl/io.h"
 
 #include <string.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdatomic.h>
 #include <sys/stat.h>
 #include <sys/unistd.h>
 #include <stdlib.h>
@@ -23,12 +26,64 @@
 
 #include "utils/logger.h"
 #include "utils/utils.h"
+#include "game.h"
 
 // Includes the following inline utilities:
 // int oflags_musl_to_newlib(int flags);
 // dirent64_bionic * dirent_newlib_to_bionic(struct dirent* dirent_newlib);
 // void stat_newlib_to_bionic(struct stat * src, stat64_bionic * dst);
 #include "reimpl/bits/_struct_converters.c"
+
+#define PROFILE_WRITE_STREAM_SLOTS 8
+
+static atomic_uintptr_t profile_write_streams[PROFILE_WRITE_STREAM_SLOTS];
+static atomic_uint profile_generation = ATOMIC_VAR_INIT(0);
+
+static bool profile_mode_is_writable(const char *mode) {
+    return mode && (strchr(mode, 'w') || strchr(mode, 'a') ||
+                    strchr(mode, '+'));
+}
+
+static bool is_primary_profile_path(const char *filename) {
+    if (!filename) return false;
+    const char *basename = strrchr(filename, '/');
+    basename = basename ? basename + 1 : filename;
+    return strcmp(basename, "Profile.save") == 0;
+}
+
+static void track_profile_write_stream(FILE *stream) {
+    if (!stream) return;
+
+    for (size_t i = 0; i < PROFILE_WRITE_STREAM_SLOTS; ++i) {
+        uintptr_t expected = 0;
+        if (atomic_compare_exchange_strong_explicit(
+                &profile_write_streams[i], &expected, (uintptr_t)stream,
+                memory_order_release, memory_order_relaxed)) {
+            return;
+        }
+    }
+
+    l_warn("Profile write stream table is full; this save will use the next "
+           "system-UI storage sync.");
+}
+
+static bool untrack_profile_write_stream(FILE *stream) {
+    if (!stream) return false;
+
+    for (size_t i = 0; i < PROFILE_WRITE_STREAM_SLOTS; ++i) {
+        uintptr_t expected = (uintptr_t)stream;
+        if (atomic_compare_exchange_strong_explicit(
+                &profile_write_streams[i], &expected, 0,
+                memory_order_acq_rel, memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint32_t profile_save_generation(void) {
+    return atomic_load_explicit(&profile_generation, memory_order_acquire);
+}
 
 FILE * fopen_soloader(const char * filename, const char * mode) {
     if (strcmp(filename, "/proc/cpuinfo") == 0) {
@@ -37,11 +92,33 @@ FILE * fopen_soloader(const char * filename, const char * mode) {
         return fopen_soloader("app0:/meminfo", mode);
     }
 
+    bool profile_file = strstr(filename, "Profile.save") != NULL;
+    struct stat profile_stat;
+    int profile_stat_result = profile_file ? stat(filename, &profile_stat) : -1;
+
 #ifdef USE_SCELIBC_IO
     FILE* ret = sceLibcBridge_fopen(filename, mode);
 #else
     FILE* ret = fopen(filename, mode);
 #endif
+
+    if (ret && is_primary_profile_path(filename) &&
+        profile_mode_is_writable(mode)) {
+        track_profile_write_stream(ret);
+    }
+
+    if (profile_file) {
+        if (ret) {
+            l_info("Profile file opened: %s (%s, previous_size=%lld).",
+                   filename, mode,
+                   profile_stat_result == 0
+                       ? (long long)profile_stat.st_size : -1LL);
+        } else {
+            l_error("Profile file could not be opened: %s (%s).",
+                    filename, mode);
+        }
+        log_flush();
+    }
 
 #ifdef DEBUG_IO_VERBOSE
     if (ret)
@@ -71,8 +148,25 @@ int open_soloader(const char * path, int oflag, ...) {
         va_end(args);
     }
 
+    int bionic_oflag = oflag;
+    bool profile_file = strstr(path, "Profile.save") != NULL;
+    struct stat profile_stat;
+    int profile_stat_result = profile_file ? stat(path, &profile_stat) : -1;
     oflag = oflags_bionic_to_newlib(oflag);
     int ret = open(path, oflag, mode);
+    if (profile_file) {
+        if (ret >= 0) {
+            l_info("Profile file descriptor opened: %s "
+                   "(flags=0x%x, previous_size=%lld).",
+                   path, bionic_oflag,
+                   profile_stat_result == 0
+                       ? (long long)profile_stat.st_size : -1LL);
+        } else {
+            l_error("Profile file descriptor failed: %s (flags=0x%x).",
+                    path, bionic_oflag);
+        }
+        log_flush();
+    }
 #ifdef DEBUG_IO_VERBOSE
     if (ret >= 0)
         l_debug("open(%s, %x): %i", path, oflag, ret);
@@ -114,11 +208,17 @@ int stat_soloader(const char * path, stat64_bionic * buf) {
 }
 
 int fclose_soloader(FILE * f) {
+    bool completed_profile_write = untrack_profile_write_stream(f);
 #ifdef USE_SCELIBC_IO
     int ret = sceLibcBridge_fclose(f);
 #else
     int ret = fclose(f);
 #endif
+
+    if (completed_profile_write && ret == 0) {
+        atomic_fetch_add_explicit(&profile_generation, 1,
+                                  memory_order_release);
+    }
 
 #ifdef DEBUG_IO_VERBOSE
     l_debug("fclose(%p): %i", f, ret);

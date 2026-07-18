@@ -1,0 +1,152 @@
+diff --git a/libopensles/IBufferQueue.c b/libopensles/IBufferQueue.c
+--- a/libopensles/IBufferQueue.c
++++ b/libopensles/IBufferQueue.c
+@@ -23,5 +23,9 @@ volatile uint32_t opensles_vita_last_source_rate;
+ volatile uint32_t opensles_vita_last_source_channels;
+ volatile uint32_t opensles_vita_last_source_bits;
++volatile uint32_t opensles_vita_resample_allocations;
++volatile uint32_t opensles_vita_resample_reuses;
++volatile uint32_t opensles_vita_resample_grows;
++volatile uint32_t opensles_vita_resample_max_bytes;
+ 
+ 
+ /** Determine the state of the audio player or audio recorder associated with a buffer queue.
+@@ -59,6 +63,17 @@ void IBufferQueue_ReleaseArrayBuffers(IBufferQueue *this)
+     }
+ }
+ 
++void IBufferQueue_ResetArrayBuffers(IBufferQueue *this)
++{
++    if ((NULL == this) || (NULL == this->mArray)) {
++        return;
++    }
++
++    for (unsigned i = 0; i < this->mNumBuffers + 1; ++i) {
++        BufferHeader_consume(&this->mArray[i]);
++    }
++}
++
+ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint32 size)
+ {
+     SL_ENTER_INTERFACE
+@@ -88,7 +103,7 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
+             const uint32_t bits = this->bps;
+             const uint32_t bytes_per_sample = bits / 8U;
+             const uint32_t input_frame_size = channels * bytes_per_sample;
+-            void *ownedBuffer = NULL;
++            void *ownedBuffer = oldRear->mOwnedBuffer;
+ 
+             if (input_rate == 0 || (channels != 1 && channels != 2) ||
+                     (bits != 8 && bits != 16) || input_frame_size == 0 ||
+@@ -113,12 +128,28 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
+             const uint32_t output_size = output_frames * 4U;
+ 
+             if (input_rate != output_rate || channels != 2 || bits != 16) {
+-                ownedBuffer = malloc(output_size);
+-                if (NULL == ownedBuffer) {
+-                    ++opensles_vita_enqueue_failures;
+-                    interface_unlock_exclusive(this);
+-                    result = SL_RESULT_RESOURCE_ERROR;
+-                    goto fail;
++                if (oldRear->mOwnedCapacity < output_size) {
++                    const SLuint32 previous_capacity = oldRear->mOwnedCapacity;
++                    void *grown_buffer = realloc(ownedBuffer, output_size);
++                    if (NULL == grown_buffer) {
++                        ++opensles_vita_enqueue_failures;
++                        interface_unlock_exclusive(this);
++                        result = SL_RESULT_RESOURCE_ERROR;
++                        goto fail;
++                    }
++                    ownedBuffer = grown_buffer;
++                    oldRear->mOwnedBuffer = grown_buffer;
++                    oldRear->mOwnedCapacity = output_size;
++                    if (previous_capacity == 0) {
++                        ++opensles_vita_resample_allocations;
++                    } else {
++                        ++opensles_vita_resample_grows;
++                    }
++                } else {
++                    ++opensles_vita_resample_reuses;
++                }
++                if (output_size > opensles_vita_resample_max_bytes) {
++                    opensles_vita_resample_max_bytes = output_size;
+                 }
+ 
+                 int16_t *dst = (int16_t *)ownedBuffer;
+@@ -152,7 +184,7 @@ SLresult IBufferQueue_Enqueue(SLBufferQueueItf self, const void *pBuffer, SLuint
+                 }
+                 pBuffer = ownedBuffer;
+             }
+-            assert(NULL == oldRear->mOwnedBuffer);
++            assert(NULL == oldRear->mBuffer && 0 == oldRear->mSize);
+             oldRear->mBuffer = pBuffer;
+             oldRear->mSize = output_size;
+             oldRear->mOwnedBuffer = ownedBuffer;
+diff --git a/libopensles/IOutputMixExt.c b/libopensles/IOutputMixExt.c
+--- a/libopensles/IOutputMixExt.c
++++ b/libopensles/IOutputMixExt.c
+@@ -96,7 +96,7 @@ static SLboolean track_check(Track *track)
+         if (audioPlayer->mBufferQueue.mClearRequested) {
+             // application thread(s) that call BufferQueue::Clear while mixer is active
+             // will block synchronously until mixer acknowledges the Clear request
+-            IBufferQueue_ReleaseArrayBuffers(&audioPlayer->mBufferQueue);
++            IBufferQueue_ResetArrayBuffers(&audioPlayer->mBufferQueue);
+             audioPlayer->mBufferQueue.mFront = &audioPlayer->mBufferQueue.mArray[0];
+             audioPlayer->mBufferQueue.mRear = &audioPlayer->mBufferQueue.mArray[0];
+             audioPlayer->mBufferQueue.mState.count = 0;
+@@ -348,7 +348,7 @@ void IOutputMixExt_FillBuffer(SLOutputMixExtItf self, void *pBuffer, SLuint32 si
+                     if (++newFront == &bufferQueue->mArray[bufferQueue->mNumBuffers + 1]) {
+                         newFront = bufferQueue->mArray;
+                     }
+-                    BufferHeader_release((BufferHeader *) oldFront);
++                    BufferHeader_consume((BufferHeader *) oldFront);
+                     bufferQueue->mFront = (BufferHeader *) newFront;
+                     assert(0 < bufferQueue->mState.count);
+                     --bufferQueue->mState.count;
+diff --git a/libopensles/IEngine.c b/libopensles/IEngine.c
+--- a/libopensles/IEngine.c
++++ b/libopensles/IEngine.c
+@@ -32,6 +32,9 @@ static SLresult IEngine_AllocateBufferQueueArray(IBufferQueue *bufferQueue)
+         if (NULL == bufferQueue->mArray) {
+             return SL_RESULT_MEMORY_FAILURE;
+         }
+     }
++    for (unsigned i = 0; i < bufferQueue->mNumBuffers + 1; ++i) {
++        BufferHeader_reset(&bufferQueue->mArray[i]);
++    }
+     bufferQueue->mFront = bufferQueue->mArray;
+     bufferQueue->mRear = bufferQueue->mArray;
+     return SL_RESULT_SUCCESS;
+diff --git a/libopensles/sles_allinclusive.h b/libopensles/sles_allinclusive.h
+--- a/libopensles/sles_allinclusive.h
++++ b/libopensles/sles_allinclusive.h
+@@ -208,6 +208,7 @@ typedef struct {
+     const void *mBuffer;
+     SLuint32 mSize;
+     void *mOwnedBuffer;
++    SLuint32 mOwnedCapacity;
+ } BufferHeader;
+ 
+ static inline void BufferHeader_reset(BufferHeader *header)
+@@ -216,6 +217,16 @@ static inline void BufferHeader_reset(BufferHeader *header)
+     header->mBuffer = NULL;
+     header->mSize = 0;
+     header->mOwnedBuffer = NULL;
++    header->mOwnedCapacity = 0;
++}
++
++/* The Vita backend converts queued Android PCM into an owned stereo buffer.
++ * Keep that allocation attached to its ring slot after consumption so the
++ * next effect enqueue can reuse it without touching the heap. */
++static inline void BufferHeader_consume(BufferHeader *header)
++{
++    header->mBuffer = NULL;
++    header->mSize = 0;
+ }
+ 
+ static inline void BufferHeader_release(BufferHeader *header)
+@@ -1357,3 +1368,4 @@ extern void IBufferQueue_Destroy(IBufferQueue *this);
+ extern void IBufferQueue_ReleaseArrayBuffers(IBufferQueue *this);
++extern void IBufferQueue_ResetArrayBuffers(IBufferQueue *this);
+ 
+ extern bool IsInterfaceInitialized(IObject *this, unsigned MPH);

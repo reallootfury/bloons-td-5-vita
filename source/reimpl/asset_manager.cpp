@@ -1,5 +1,6 @@
 #include "reimpl/asset_manager.h"
 #include "utils/logger.h"
+#include "game.h"
 
 #include <pthread.h>
 #include <malloc.h>
@@ -29,6 +30,22 @@ typedef struct aAssetDir {
 } assetDir;
 
 static AAssetManager * g_AAssetManager = nullptr;
+static unsigned long long diag_opens;
+static unsigned long long diag_active;
+static unsigned long long diag_reads;
+static unsigned long long diag_bytes;
+static unsigned long long diag_seeks;
+static unsigned long long diag_last_position;
+static unsigned long long diag_last_size;
+static bool diag_eof_short_circuit_logged;
+
+static FILE *open_asset_file(const std::string &path) {
+#ifdef USE_SCELIBC_IO
+    return sceLibcBridge_fopen(path.c_str(), "rb");
+#else
+    return fopen(path.c_str(), "rb");
+#endif
+}
 
 AAssetManager * AAssetManager_create() {
     if (g_AAssetManager) return g_AAssetManager;
@@ -50,24 +67,24 @@ AAssetManager * AAssetManager_fromJava(void *env, void *assetManager) {
 }
 
 AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode) {
-    std::string realp = std::string(DATA_PATH) + std::string("assets/") + std::string(filename);
+    (void)mgr;
+    (void)mode;
+    if (!filename) {
+        return nullptr;
+    }
+
+    std::string realp = std::string(btd5_data_path()) + "assets/" + filename;
+    FILE *file = open_asset_file(realp);
+    if (!file) {
+        return nullptr;
+    }
 
     auto * a = new aAsset;
     a->filename = (char *) malloc(realp.length() + 1);
     strcpy(a->filename, realp.c_str());
     a->bytesRead = 0;
-
-#ifdef USE_SCELIBC_IO
-    a->f = sceLibcBridge_fopen((const char *)a->filename, "rb");
-#else
-    a->f = fopen((const char *)a->filename, "rb");
-#endif
-
-    if (!a->f) {
-        free(a->filename);
-        delete a;
-        a = nullptr;
-    } else {
+    a->f = file;
+    {
 #ifdef USE_SCELIBC_IO
         sceLibcBridge_fseek(a->f, 0, SEEK_END);
         a->fileSize = sceLibcBridge_ftell(a->f);
@@ -78,6 +95,10 @@ AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode) {
         fseek(a->f, 0, SEEK_SET);
 #endif
         a->opened = true;
+        __atomic_add_fetch(&diag_opens, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&diag_active, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&diag_last_size, a->fileSize, __ATOMIC_RELAXED);
+        __atomic_store_n(&diag_last_position, 0, __ATOMIC_RELAXED);
     }
 
 #ifdef DEBUG_ASSET_IO_VERBOSE
@@ -101,6 +122,9 @@ void AAsset_close(AAsset* asset) {
             fclose(a->f);
 #endif
         }
+        if (a->opened) {
+            __atomic_sub_fetch(&diag_active, 1, __ATOMIC_RELAXED);
+        }
         delete a;
     }
 }
@@ -120,6 +144,28 @@ int AAsset_read(AAsset* asset, void* buf, size_t count) {
         return -1;
     }
 
+    /* SceLibcBridge/FIOS can leave a synchronous fread waiting on its
+     * completion semaphore when it is submitted with the stream already at
+     * exact EOF. Android AAsset_read instead guarantees an immediate zero at
+     * EOF. BTD5's byte-oriented archive parser performs one final read after
+     * consuming the last byte, so enforce the Android contract before
+     * entering the bridge and never submit a request beyond the asset. */
+    if (count == 0) {
+        return 0;
+    }
+    if (a->bytesRead >= a->fileSize) {
+        if (!__atomic_exchange_n(&diag_eof_short_circuit_logged, true,
+                                 __ATOMIC_RELAXED)) {
+            l_info("AAsset EOF short-circuit: %s (%u/%u).", a->filename,
+                   (unsigned int)a->bytesRead, (unsigned int)a->fileSize);
+        }
+        return 0;
+    }
+    size_t remaining = a->fileSize - a->bytesRead;
+    if (count > remaining) {
+        count = remaining;
+    }
+
 #ifdef USE_SCELIBC_IO
     size_t ret = sceLibcBridge_fread(buf, 1, count, a->f);
 #else
@@ -128,6 +174,10 @@ int AAsset_read(AAsset* asset, void* buf, size_t count) {
 
     if (ret > 0) {
         a->bytesRead += ret;
+        __atomic_add_fetch(&diag_reads, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&diag_bytes, ret, __ATOMIC_RELAXED);
+        __atomic_store_n(&diag_last_position, a->bytesRead, __ATOMIC_RELAXED);
+        __atomic_store_n(&diag_last_size, a->fileSize, __ATOMIC_RELAXED);
         return (int) ret;
     } else {
 #ifdef USE_SCELIBC_IO
@@ -169,7 +219,23 @@ off_t AAsset_seek(AAsset* asset, off_t offset, int whence) {
 #else
     a->bytesRead = (size_t)ftell(a->f);
 #endif
+    __atomic_add_fetch(&diag_seeks, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&diag_last_position, a->bytesRead, __ATOMIC_RELAXED);
+    __atomic_store_n(&diag_last_size, a->fileSize, __ATOMIC_RELAXED);
     return (off_t)a->bytesRead;
+}
+
+void AAsset_getDiagnostics(AAssetDiagnostics *diagnostics) {
+    if (!diagnostics) return;
+    diagnostics->opens = __atomic_load_n(&diag_opens, __ATOMIC_RELAXED);
+    diagnostics->active = __atomic_load_n(&diag_active, __ATOMIC_RELAXED);
+    diagnostics->reads = __atomic_load_n(&diag_reads, __ATOMIC_RELAXED);
+    diagnostics->bytes = __atomic_load_n(&diag_bytes, __ATOMIC_RELAXED);
+    diagnostics->seeks = __atomic_load_n(&diag_seeks, __ATOMIC_RELAXED);
+    diagnostics->last_position = __atomic_load_n(&diag_last_position,
+                                                  __ATOMIC_RELAXED);
+    diagnostics->last_size = __atomic_load_n(&diag_last_size,
+                                              __ATOMIC_RELAXED);
 }
 
 off_t AAsset_getRemainingLength(AAsset* asset) {
@@ -204,7 +270,7 @@ off_t AAsset_getLength(AAsset* asset) {
 
 AAssetDir* AAssetManager_openDir(AAssetManager* mgr, const char* dirName) {
     (void)mgr;
-    std::string realp = std::string(DATA_PATH) + "assets/" + (dirName ? dirName : "");
+    std::string realp = std::string(btd5_data_path()) + "assets/" + (dirName ? dirName : "");
     auto *dir = new aAssetDir;
     dir->dir = opendir(realp.c_str());
     dir->entry = nullptr;
@@ -250,6 +316,7 @@ int AAsset_openFileDescriptor(AAsset* asset, off_t* outStart, off_t* outLength) 
 #endif
         }
         a->opened = false;
+        __atomic_sub_fetch(&diag_active, 1, __ATOMIC_RELAXED);
     }
     int ret = open(a->filename, O_RDONLY);
     l_debug("AAsset_openFileDescriptor(%p/\"%s\", %p, %p): ret %i", asset, a->filename, outStart, outLength, ret);

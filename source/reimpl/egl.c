@@ -9,6 +9,7 @@
 
 #include "utils/glutil.h"
 #include "utils/logger.h"
+#include "utils/settings.h"
 #include "diagnostics.h"
 #include "reimpl/controls.h"
 
@@ -16,9 +17,13 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <psp2/kernel/processmgr.h>
 
 static atomic_bool first_swap_reported = ATOMIC_VAR_INIT(false);
 static atomic_uint_fast64_t swap_count = ATOMIC_VAR_INIT(0);
+/* eglSwapBuffers is called by BTD5's main render thread. These interval
+ * counters therefore need no lock and are reset by that same thread. */
+static EGLTimingStats swap_timing;
 
 EGLBoolean eglInitialize(EGLDisplay dpy, EGLint *major, EGLint *minor) {
     l_debug("eglInitialize(0x%x)", (int)dpy);
@@ -65,10 +70,10 @@ EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface eglSurface,
             *value = 0;
             break;
         case EGL_WIDTH:
-            *value = 960;
+            *value = settings_render_width();
             break;
         case EGL_HEIGHT:
-            *value = 544;
+            *value = settings_render_height();
             break;
         case EGL_TEXTURE_FORMAT:
             *value = EGL_TEXTURE_RGBA;
@@ -95,8 +100,9 @@ EGLBoolean eglQuerySurface(EGLDisplay dpy, EGLSurface eglSurface,
             *value = 220 * EGL_DISPLAY_SCALING; // VITA DPI is 220
             break;
         case EGL_PIXEL_ASPECT_RATIO:
-            // Please don't ask why * EGL_DISPLAY_SCALING, the document says it
-            *value = 960 / 544 * EGL_DISPLAY_SCALING;
+            /* Both render modes are scaled uniformly to the Vita display, so
+             * their pixels remain square. */
+            *value = EGL_DISPLAY_SCALING;
             break;
         case EGL_RENDER_BUFFER:
             *value = EGL_BACK_BUFFER;
@@ -311,10 +317,17 @@ EGLBoolean eglTerminate(EGLDisplay dpy) {
 }
 
 EGLBoolean eglSwapBuffers_soloader(EGLDisplay display, EGLSurface surface) {
+    uint64_t timing_started_us = sceKernelGetProcessTimeWide();
     btd5_diag_set_stage(BTD5_STAGE_EGL_SWAP);
     controls_draw_cursor();
     EGLBoolean result = eglSwapBuffers(display, surface);
     btd5_diag_set_stage(BTD5_STAGE_EGL_SWAP_RETURNED);
+    uint64_t elapsed_us = sceKernelGetProcessTimeWide() - timing_started_us;
+    swap_timing.samples++;
+    swap_timing.total_us += elapsed_us;
+    if (elapsed_us > swap_timing.max_us) {
+        swap_timing.max_us = elapsed_us;
+    }
     atomic_fetch_add_explicit(&swap_count, 1, memory_order_relaxed);
     if (!atomic_exchange_explicit(&first_swap_reported, true,
                                   memory_order_relaxed)) {
@@ -326,6 +339,15 @@ EGLBoolean eglSwapBuffers_soloader(EGLDisplay display, EGLSurface surface) {
 
 uint64_t egl_swap_count(void) {
     return atomic_load_explicit(&swap_count, memory_order_relaxed);
+}
+
+void egl_take_timing_stats(EGLTimingStats *stats) {
+    if (!stats) {
+        return;
+    }
+
+    *stats = swap_timing;
+    memset(&swap_timing, 0, sizeof(swap_timing));
 }
 
 EGLContext eglGetCurrentContext (void) {

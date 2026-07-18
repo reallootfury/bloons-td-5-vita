@@ -23,6 +23,8 @@ void resolve_imports(so_module *mod);
 
 void so_patch();
 
+void soloader_platform_init();
+
 void soloader_init_all();
 
 #ifdef __cplusplus

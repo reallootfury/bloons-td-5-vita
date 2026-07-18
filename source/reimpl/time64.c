@@ -51,6 +51,7 @@ gmtime64_r() is a 64-bit equivalent of gmtime_r().
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <limits.h>
 #include "time64.h"
 
 /* BIONIC_BEGIN */
@@ -804,4 +805,42 @@ char *asctime64( const struct TM* date ) {
 
 char *ctime64( const Time64_T* time ) {
     return asctime64(localtime64(time));
+}
+
+/*
+ * BTD5 4.7 sometimes uses small epoch-relative values (for example 39) with
+ * localtime() while calculating the next day boundary. Android/Bionic accepts
+ * these as dates in January 1970. Vita libc delegates to sceRtc and can return
+ * NULL for the same input, which the game does not expect. Keep the Android
+ * imports internally consistent in UTC and use the calendar math above, which
+ * supports the complete signed time_t range without sceRtc.
+ */
+static _Thread_local struct TM Static_Gmtime_Date;
+static _Thread_local struct TM Static_Localtime_Date;
+
+struct TM *gmtime_r_soloader(const time_t *in_time, struct TM *result) {
+    Time64_T wide_time = (Time64_T)*in_time;
+    return gmtime64_r(&wide_time, result);
+}
+
+struct TM *gmtime_soloader(const time_t *in_time) {
+    return gmtime_r_soloader(in_time, &Static_Gmtime_Date);
+}
+
+struct TM *localtime_r_soloader(const time_t *in_time, struct TM *result) {
+    Time64_T wide_time = (Time64_T)*in_time;
+    return gmtime64_r(&wide_time, result);
+}
+
+struct TM *localtime_soloader(const time_t *in_time) {
+    return localtime_r_soloader(in_time, &Static_Localtime_Date);
+}
+
+time_t mktime_soloader(struct TM *date) {
+    Time64_T wide_time = timegm64(date);
+    if (wide_time < (Time64_T)LONG_MIN || wide_time > (Time64_T)LONG_MAX) {
+        errno = EOVERFLOW;
+        return (time_t)-1;
+    }
+    return (time_t)wide_time;
 }

@@ -57,6 +57,14 @@ EGLBoolean eglSwapBuffers_soloader(EGLDisplay display, EGLSurface surface);
 
 uint64_t egl_swap_count(void);
 
+typedef struct EGLTimingStats {
+    uint64_t samples;
+    uint64_t total_us;
+    uint64_t max_us;
+} EGLTimingStats;
+
+void egl_take_timing_stats(EGLTimingStats *stats);
+
 EGLContext eglGetCurrentContext (void);
 
 EGLBoolean eglGetConfigs(EGLDisplay display, EGLConfig * configs,

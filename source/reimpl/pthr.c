@@ -33,8 +33,26 @@ extern so_module so_mod;
 
 static atomic_uintptr_t watched_cond = ATOMIC_VAR_INIT(0);
 static atomic_uint condition_poll_wakeups = ATOMIC_VAR_INIT(0);
+static atomic_uint android_threads_created = ATOMIC_VAR_INIT(0);
+static atomic_uint android_semaphores_created = ATOMIC_VAR_INIT(0);
 static atomic_int android_thread_ids[PTHR_MAX_THREADS];
 static atomic_uintptr_t android_thread_starts[PTHR_MAX_THREADS];
+static atomic_uintptr_t android_thread_tasks[PTHR_MAX_THREADS];
+static atomic_uintptr_t android_thread_invokes[PTHR_MAX_THREADS];
+static atomic_uintptr_t android_thread_sync_callers[PTHR_MAX_THREADS];
+static atomic_int android_thread_sync_ops[PTHR_MAX_THREADS];
+static _Thread_local int android_thread_slot = -1;
+static _Thread_local bool barrier_wait_logged = false;
+
+enum {
+    PTHR_SYNC_NONE = 0,
+    PTHR_SYNC_MUTEX_LOCK,
+    PTHR_SYNC_COND_WAIT,
+    PTHR_SYNC_COND_TIMEDWAIT,
+    PTHR_SYNC_JOIN,
+    PTHR_SYNC_SEM_WAIT,
+    PTHR_SYNC_SEM_TIMEDWAIT,
+};
 
 typedef struct PthrStartContext {
     void *(*start)(void *);
@@ -50,9 +68,67 @@ static unsigned int game_address_offset(const void *address) {
     return 0xffffffffu;
 }
 
+static uintptr_t boost_thread_task(void *start, void *param,
+                                   uintptr_t *invoke) {
+    *invoke = 0;
+    unsigned int start_offset = game_address_offset(start);
+    if (!param || (start_offset != 0x007ba561u &&
+                   start_offset != 0x007408ddu)) {
+        return 0;
+    }
+
+    /* Both pinned executables use Boost 1.x's pthread entry wrapper. Its
+     * argument stores thread_data_base at +4; the virtual run() target is the
+     * third vtable entry.  Recording it turns the otherwise generic Boost
+     * address into the game's actual loading task in watchdog logs. */
+    void *thread_data = *(void **)((char *)param + 4);
+    if (!thread_data) return 0;
+    void **vtable = *(void ***)thread_data;
+    if (!vtable) return 0;
+    uintptr_t task = (uintptr_t)vtable[2];
+
+    /* BTD5 4.7's CApp Boost bind wrapper dispatches the actual loading
+     * function stored at +104. Keep both addresses: task describes the Boost
+     * type, while invoke identifies the game subsystem doing the work. */
+    if (game_address_offset((void *)task) == 0x004de153u) {
+        *invoke = *(uintptr_t *)((char *)thread_data + 104);
+    }
+    return task;
+}
+
+static void worker_sync_begin(int op, const void *caller) {
+    if (android_thread_slot < 0) return;
+    atomic_store_explicit(&android_thread_sync_callers[android_thread_slot],
+                          (uintptr_t)caller, memory_order_relaxed);
+    atomic_store_explicit(&android_thread_sync_ops[android_thread_slot], op,
+                          memory_order_release);
+}
+
+static void worker_sync_end(void) {
+    if (android_thread_slot < 0) return;
+    atomic_store_explicit(&android_thread_sync_ops[android_thread_slot],
+                          PTHR_SYNC_NONE, memory_order_release);
+}
+
+static const char *worker_sync_name(int op) {
+    switch (op) {
+    case PTHR_SYNC_MUTEX_LOCK: return "mutex_lock";
+    case PTHR_SYNC_COND_WAIT: return "cond_wait";
+    case PTHR_SYNC_COND_TIMEDWAIT: return "cond_timedwait";
+    case PTHR_SYNC_JOIN: return "join";
+    case PTHR_SYNC_SEM_WAIT: return "sem_wait";
+    case PTHR_SYNC_SEM_TIMEDWAIT: return "sem_timedwait";
+    default: return "none";
+    }
+}
+
 static void *pthread_start_trampoline(void *opaque) {
     PthrStartContext context = *(PthrStartContext *)opaque;
     free(opaque);
+
+    uintptr_t invoke = 0;
+    uintptr_t task = boost_thread_task((void *)context.start, context.param,
+                                       &invoke);
 
     int thread_id = sceKernelGetThreadId();
     int slot = -1;
@@ -64,7 +140,12 @@ static void *pthread_start_trampoline(void *opaque) {
             atomic_store_explicit(&android_thread_starts[i],
                                   (uintptr_t)context.start,
                                   memory_order_release);
+            atomic_store_explicit(&android_thread_tasks[i], task,
+                                  memory_order_release);
+            atomic_store_explicit(&android_thread_invokes[i], invoke,
+                                  memory_order_release);
             slot = i;
+            android_thread_slot = i;
             break;
         }
     }
@@ -72,6 +153,12 @@ static void *pthread_start_trampoline(void *opaque) {
     void *result = context.start(context.param);
     if (slot >= 0) {
         atomic_store_explicit(&android_thread_starts[slot], 0,
+                              memory_order_relaxed);
+        atomic_store_explicit(&android_thread_tasks[slot], 0,
+                              memory_order_relaxed);
+        atomic_store_explicit(&android_thread_invokes[slot], 0,
+                              memory_order_relaxed);
+        atomic_store_explicit(&android_thread_sync_ops[slot], PTHR_SYNC_NONE,
                               memory_order_relaxed);
         atomic_store_explicit(&android_thread_ids[slot], 0,
                               memory_order_release);
@@ -93,14 +180,32 @@ void pthr_diag_log_threads(void) {
         unsigned int start_offset = game_address_offset((void *)
             atomic_load_explicit(&android_thread_starts[i],
                                  memory_order_acquire));
+        unsigned int task_offset = game_address_offset((void *)
+            atomic_load_explicit(&android_thread_tasks[i],
+                                 memory_order_acquire));
+        unsigned int invoke_offset = game_address_offset((void *)
+            atomic_load_explicit(&android_thread_invokes[i],
+                                 memory_order_acquire));
+        int sync_op = atomic_load_explicit(&android_thread_sync_ops[i],
+                                           memory_order_acquire);
+        unsigned int sync_caller = game_address_offset((void *)
+            atomic_load_explicit(&android_thread_sync_callers[i],
+                                 memory_order_relaxed));
         if (ret == 0) {
-            l_warn("Android worker %s (0x%x, start SO+0x%08x): status "
+            l_warn("Android worker %s (0x%x, start SO+0x%08x, task "
+                   "SO+0x%08x, invoke SO+0x%08x): status "
                    "0x%x, wait type %u, wait id 0x%x, CPU %d.",
-                   info.name, thread_id, start_offset, info.status,
-                   info.waitType, info.waitId, info.currentCpuId);
+                   info.name, thread_id, start_offset, task_offset,
+                   invoke_offset, info.status, info.waitType, info.waitId,
+                   info.currentCpuId);
+            if (sync_op != PTHR_SYNC_NONE) {
+                l_warn("Android worker active sync: %s from SO+0x%08x.",
+                       worker_sync_name(sync_op), sync_caller);
+            }
         } else {
             l_warn("Could not inspect Android worker 0x%x (start "
-                   "SO+0x%08x): 0x%x.", thread_id, start_offset, ret);
+                   "SO+0x%08x, task SO+0x%08x, invoke SO+0x%08x): 0x%x.",
+                   thread_id, start_offset, task_offset, invoke_offset, ret);
         }
     }
 }
@@ -392,6 +497,13 @@ int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr
         free(context);
     }
 
+    unsigned int sequence = atomic_fetch_add_explicit(
+        &android_threads_created, 1, memory_order_relaxed) + 1;
+    if (sequence <= 16 || ret != 0) {
+        l_info("Android pthread_create #%u: start SO+0x%08x, result %d.",
+               sequence, game_address_offset((void *)start), ret);
+    }
+
     return ret;
 }
 
@@ -442,9 +554,15 @@ int pthread_mutex_lock_soloader(pthread_mutex_t_bionic *mutex)
         int ret = _mutex_t_static_init(mutex, NULL);
         if (ret != 0 || !mutex->real_ptr) return ret ? ret : EINVAL;
     }
+#ifdef DEBUG_SOLOADER
+    worker_sync_begin(PTHR_SYNC_MUTEX_LOCK, __builtin_return_address(0));
     btd5_diag_set_stage(BTD5_STAGE_MUTEX_LOCK);
+#endif
     int ret = pthread_mutex_lock(mutex->real_ptr);
+#ifdef DEBUG_SOLOADER
     btd5_diag_set_stage(BTD5_STAGE_MUTEX_LOCK_RETURNED);
+    worker_sync_end();
+#endif
     return ret;
 }
 
@@ -462,15 +580,26 @@ int pthread_mutex_unlock_soloader(pthread_mutex_t_bionic *mutex)
 {
     if (!mutex) return EINVAL;
     if (!_mutex_t_has_real_ptr(mutex)) return EINVAL;
+#ifdef DEBUG_SOLOADER
     btd5_diag_set_stage(BTD5_STAGE_MUTEX_UNLOCK);
+#endif
     int ret = pthread_mutex_unlock(mutex->real_ptr);
+#ifdef DEBUG_SOLOADER
     btd5_diag_set_stage(BTD5_STAGE_MUTEX_UNLOCK_RETURNED);
+#endif
     return ret;
 }
 
 int pthread_join_soloader(pthread_t thread, void **value_ptr)
 {
-    return pthread_join(thread, value_ptr);
+    if (btd5_diag_is_current_thread()) {
+        l_warn("Vita main entering Android pthread_join from SO+0x%08x.",
+               game_address_offset(__builtin_return_address(0)));
+    }
+    worker_sync_begin(PTHR_SYNC_JOIN, __builtin_return_address(0));
+    int ret = pthread_join(thread, value_ptr);
+    worker_sync_end();
+    return ret;
 }
 
 int pthread_condattr_init_soloader(pthread_condattr_t *attr)
@@ -557,7 +686,10 @@ int pthread_cond_timedwait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t
     const void *caller = __builtin_return_address(0);
     bool watched = cond_wait_watch_begin(cond, mutex, caller, true);
     btd5_diag_set_stage(BTD5_STAGE_COND_WAIT);
+    worker_sync_begin(PTHR_SYNC_COND_TIMEDWAIT,
+                      __builtin_return_address(0));
     ret = pthread_cond_timedwait(cond->real_ptr, mutex->real_ptr, abstime);
+    worker_sync_end();
     btd5_diag_set_stage(BTD5_STAGE_COND_WAIT_RETURNED);
     int bionic_ret = errno_newlib_to_bionic(ret);
     if (bionic_ret != 0 && bionic_ret != ETIMEDOUT_BIONIC) {
@@ -583,6 +715,21 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
     }
 
     const void *caller = __builtin_return_address(0);
+    unsigned int caller_offset = game_address_offset(caller);
+    if (!barrier_wait_logged && caller_offset == 0x004dd815u) {
+        /* In BTD5 4.7 this import is reached from boost::barrier::wait().
+         * The condition and mutex occupy barrier+8 and barrier+4; the live
+         * count/generation at +12/+16 tell us whether both participants are
+         * using the same Android object and actually serializing on it. */
+        const uint32_t *barrier = (const uint32_t *)((const char *)cond - 8);
+        l_warn("BTD5 barrier entry: thread 0x%x (%s), barrier %p, count=%u, "
+               "generation=%u, cond %p -> %p, mutex %p -> %p.",
+               sceKernelGetThreadId(),
+               android_thread_slot >= 0 ? "Android worker" : "Vita main",
+               barrier, barrier[3], barrier[4], cond, cond->real_ptr,
+               mutex, mutex->real_ptr);
+        barrier_wait_logged = true;
+    }
     bool watched = cond_wait_watch_begin(cond, mutex, caller, false);
     btd5_diag_set_stage(BTD5_STAGE_COND_WAIT);
 
@@ -599,8 +746,10 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
             deadline.tv_sec++;
             deadline.tv_nsec -= 1000 * 1000 * 1000L;
         }
+        worker_sync_begin(PTHR_SYNC_COND_WAIT, caller);
         ret = pthread_cond_timedwait(cond->real_ptr, mutex->real_ptr,
                                      &deadline);
+        worker_sync_end();
         if (ret == ETIMEDOUT) {
             unsigned int count = atomic_fetch_add_explicit(
                 &condition_poll_wakeups, 1, memory_order_relaxed) + 1;
@@ -614,7 +763,9 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
             ret = errno_newlib_to_bionic(ret);
         }
     } else {
+        worker_sync_begin(PTHR_SYNC_COND_WAIT, caller);
         ret = pthread_cond_wait(cond->real_ptr, mutex->real_ptr);
+        worker_sync_end();
     }
     btd5_diag_set_stage(BTD5_STAGE_COND_WAIT_RETURNED);
     cond_wait_watch_end(watched, cond, caller, ret);
@@ -759,6 +910,13 @@ int sem_getvalue_soloader (int * uid, int * sval) {
 
 int sem_init_soloader (int * uid, int pshared, unsigned int value) {
     *uid = sceKernelCreateSema("sema", 0, (int) value, 0x7fffffff, NULL);
+    unsigned int sequence = atomic_fetch_add_explicit(
+        &android_semaphores_created, 1, memory_order_relaxed) + 1;
+    if (sequence <= 24 || *uid < 0) {
+        l_info("Android sem_init #%u: uid 0x%x, value %u, caller "
+               "SO+0x%08x.", sequence, *uid, value,
+               game_address_offset(__builtin_return_address(0)));
+    }
     if (*uid < 0)
         return -1;
     return 0;
@@ -771,16 +929,28 @@ int sem_post_soloader (int * uid) {
 }
 
 int sem_timedwait_soloader (int * uid, const struct timespec * abstime) {
+    worker_sync_begin(PTHR_SYNC_SEM_TIMEDWAIT, __builtin_return_address(0));
     uint timeout = 1000;
-    if (sceKernelWaitSema(*uid, 1, &timeout) >= 0)
+    if (sceKernelWaitSema(*uid, 1, &timeout) >= 0) {
+        worker_sync_end();
         return 0;
-    if (!abstime) return -1;
+    }
+    if (!abstime) {
+        worker_sync_end();
+        return -1;
+    }
     long long now = (long long) current_timestamp_ms() * 1000; // us
     long long _timeout = abstime->tv_sec * 1000 * 1000 + abstime->tv_nsec / 1000; // us
-    if (_timeout-now >= 0) return -1;
-    uint timeout_real = _timeout - now;
-    if (sceKernelWaitSema(*uid, 1, &timeout_real) < 0)
+    if (_timeout-now >= 0) {
+        worker_sync_end();
         return -1;
+    }
+    uint timeout_real = _timeout - now;
+    if (sceKernelWaitSema(*uid, 1, &timeout_real) < 0) {
+        worker_sync_end();
+        return -1;
+    }
+    worker_sync_end();
     return 0;
 }
 
@@ -792,7 +962,21 @@ int sem_trywait_soloader (int * uid) {
 }
 
 int sem_wait_soloader (int * uid) {
-    if (sceKernelWaitSema(*uid, 1, NULL) < 0)
+    if (btd5_diag_is_current_thread()) {
+        SceKernelSemaInfo info = {0};
+        info.size = sizeof(info);
+        int info_result = sceKernelGetSemaInfo(*uid, &info);
+        l_warn("Vita main entering Android sem_wait from SO+0x%08x: uid "
+               "0x%x, current count %d (info 0x%x).",
+               game_address_offset(__builtin_return_address(0)), *uid,
+               info_result >= 0 ? info.currentCount : -1, info_result);
+        log_flush();
+    }
+    worker_sync_begin(PTHR_SYNC_SEM_WAIT, __builtin_return_address(0));
+    if (sceKernelWaitSema(*uid, 1, NULL) < 0) {
+        worker_sync_end();
         return -1;
+    }
+    worker_sync_end();
     return 0;
 }

@@ -14,6 +14,7 @@
 #include "utils/logger.h"
 #include "utils/utils.h"
 #include "utils/settings.h"
+#include "game.h"
 
 #include <reimpl/controls.h>
 #include <reimpl/pthr.h>
@@ -34,7 +35,12 @@
 
 extern so_module so_mod;
 
-void soloader_init_all() {
+void soloader_platform_init() {
+	static bool platform_initialized = false;
+	if (platform_initialized)
+		return;
+	platform_initialized = true;
+
 	// Launch `app0:configurator.bin` on `-config` init param
     sceAppUtilInit(&(SceAppUtilInitParam){}, &(SceAppUtilBootParam){});
     SceAppUtilAppEventParam eventParam;
@@ -46,6 +52,10 @@ void soloader_init_all() {
         if (strstr(buffer, "-config"))
             sceAppMgrLoadExec("app0:/configurator.bin", NULL, NULL);
     }
+}
+
+void soloader_init_all() {
+    soloader_platform_init();
 
     // Set default overclock values
     scePowerSetArmClockFrequency(444);
@@ -54,7 +64,7 @@ void soloader_init_all() {
     scePowerSetGpuXbarClockFrequency(166);
 
 #ifdef USE_SCELIBC_IO
-    if (fios_init(DATA_PATH) == 0)
+    if (fios_init(btd5_data_path()) == 0)
         l_success("FIOS initialized.");
 #endif
 
@@ -64,15 +74,17 @@ void soloader_init_all() {
     }
     l_success("kubridge check passed.");
 
-    if (!file_exists(SO_PATH)) {
+    if (!file_exists(btd5_so_path())) {
         fatal_error("Looks like you haven't installed the data files for this "
                     "port, or they are in an incorrect location. Please make "
-                    "sure that you have %s file exactly at that path.", SO_PATH);
+                    "sure that you have %s file exactly at that path.", btd5_so_path());
     }
 
-    if (so_file_load(&so_mod, SO_PATH, LOAD_ADDRESS) < 0) {
-        l_fatal("SO could not be loaded.");
-        fatal_error("Error: could not load %s.", SO_PATH);
+    int so_load_result = so_file_load(&so_mod, btd5_so_path(), LOAD_ADDRESS);
+    if (so_load_result < 0) {
+        l_fatal("SO could not be loaded: 0x%08X.", so_load_result);
+        fatal_error("Error: could not load %s.\nResult: 0x%08X",
+                    btd5_so_path(), so_load_result);
     }
     if (!so_mod.exidx_base || !so_mod.exidx_count) {
         fatal_error("Unsupported BTD5 executable: ARM exception index is missing.");

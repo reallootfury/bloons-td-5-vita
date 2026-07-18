@@ -139,7 +139,9 @@ char * strerror_soloader(int error_number) {
 			return (char *) errno_translation[i].strerror;
 	}
 
-	l_warn("Unexpected bionic errno %i, will return 'Success' instead of translation", error_number);
+	/* BTD5 probes strerror across the numeric errno range during startup.
+	 * Unknown descriptions are non-fatal and logging each probe obscures the
+	 * useful loader diagnostics. */
 	return (char *) errno_translation[0].strerror;
 }
 
@@ -152,7 +154,6 @@ int strerror_r_soloader(int error_number, char* buf, size_t buf_len) {
 	}
 
 	if (err == NULL) {
-		l_warn("Unexpected bionic errno %i, will return 'Success' instead of translation", error_number);
 		err = errno_translation[0].strerror;
 	}
 

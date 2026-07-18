@@ -20,6 +20,7 @@ extern "C" {
 #endif
 
 #include <stdio.h>
+#include <stdint.h>
 #include <sys/dirent.h>
 #include <sys/syslimits.h>
 #include <sys/fcntl.h>
@@ -85,6 +86,11 @@ int readdir_r_soloader(DIR * dirp, dirent64_bionic * entry,
 int close_soloader(int fd);
 
 int fclose_soloader(FILE *f);
+
+/* Increments after the game successfully closes a newly written primary
+ * Profile.save. The Vita main loop uses this to durably commit completed save
+ * transactions without forcing Android lifecycle calls. */
+uint32_t profile_save_generation(void);
 
 int closedir_soloader(DIR *dir);
 

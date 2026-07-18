@@ -3,6 +3,7 @@
 #include <minimp3_ex.h>
 
 #include "music.h"
+#include "game.h"
 #include "utils/logger.h"
 #include "utils/utils.h"
 
@@ -18,6 +19,7 @@
 
 #define BTD5_MUSIC_MAGIC 0x42544d50u
 #define BTD5_MUSIC_GRAIN 1152
+#define BTD5_MUSIC_THREAD_STACK (256 * 1024)
 
 typedef struct BTD5MusicPlayer {
     atomic_bool allocated;
@@ -58,6 +60,7 @@ static void *music_thread_main(void *unused) {
     memset(&decoder, 0, sizeof(decoder));
     bool decoder_open = false;
     int port = -1;
+    int applied_volume = -1;
     unsigned int local_generation = 0;
     BTD5MusicPlayer *current = NULL;
     mp3d_sample_t samples[BTD5_MUSIC_GRAIN * 2];
@@ -70,6 +73,7 @@ static void *music_thread_main(void *unused) {
 
         if (generation != local_generation || requested != current) {
             close_decoder(&decoder, &decoder_open, &port);
+            applied_volume = -1;
             current = requested;
             local_generation = generation;
 
@@ -149,9 +153,14 @@ static void *music_thread_main(void *unused) {
 
         int level = atomic_load_explicit(&current->volume,
                                          memory_order_relaxed);
-        int volumes[2] = {level, level};
-        sceAudioOutSetVolume(port,
-            SCE_AUDIO_VOLUME_FLAG_L_CH | SCE_AUDIO_VOLUME_FLAG_R_CH, volumes);
+        if (level != applied_volume) {
+            int volumes[2] = {level, level};
+            sceAudioOutSetVolume(
+                port,
+                SCE_AUDIO_VOLUME_FLAG_L_CH | SCE_AUDIO_VOLUME_FLAG_R_CH,
+                volumes);
+            applied_volume = level;
+        }
         int output_result = sceAudioOutOutput(port, samples);
         if (output_result < 0) {
             l_error("Music output failed: 0x%08x.",
@@ -174,7 +183,15 @@ static bool ensure_music_thread(void) {
     }
 
     pthread_t thread;
-    int result = pthread_create(&thread, NULL, music_thread_main, NULL);
+    pthread_attr_t attr;
+    int result = pthread_attr_init(&attr);
+    if (result == 0) {
+        result = pthread_attr_setstacksize(&attr, BTD5_MUSIC_THREAD_STACK);
+
+        if (result == 0)
+            result = pthread_create(&thread, &attr, music_thread_main, NULL);
+        pthread_attr_destroy(&attr);
+    }
     if (result != 0) {
         atomic_store_explicit(&thread_started, false, memory_order_release);
         l_error("Could not start music thread: %d.", result);
@@ -182,7 +199,8 @@ static bool ensure_music_thread(void) {
         return false;
     }
     pthread_detach(thread);
-    l_info("Music decoder thread started.");
+    l_info("Music decoder thread started with a %d KiB stack.",
+           BTD5_MUSIC_THREAD_STACK / 1024);
     log_flush();
     return true;
 }
@@ -208,8 +226,8 @@ void *btd5_music_load(const char *asset_name) {
         return NULL;
     }
 
-    int length = snprintf(player->path, sizeof(player->path),
-                          DATA_PATH "assets/%s", asset_name);
+    int length = snprintf(player->path, sizeof(player->path), "%sassets/%s",
+                          btd5_data_path(), asset_name);
     if (length < 0 || (size_t)length >= sizeof(player->path) ||
         !file_exists(player->path)) {
         l_error("Missing music asset: %s", player->path);

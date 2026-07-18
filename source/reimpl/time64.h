@@ -56,6 +56,17 @@ time64_t mktime64(const struct tm* _Nonnull);
 time64_t timegm64(const struct tm* _Nonnull);
 time64_t timelocal64(const struct tm* _Nonnull);
 
+/* Android accepts the full signed 32-bit Unix epoch range. Vita libc's RTC
+ * backed localtime can reject early-1970 values, so imported Android code uses
+ * these UTC-consistent wrappers instead. */
+struct tm* _Nullable gmtime_soloader(const time_t* _Nonnull);
+struct tm* _Nullable gmtime_r_soloader(const time_t* _Nonnull,
+                                       struct tm* _Nonnull);
+struct tm* _Nullable localtime_soloader(const time_t* _Nonnull);
+struct tm* _Nullable localtime_r_soloader(const time_t* _Nonnull,
+                                          struct tm* _Nonnull);
+time_t mktime_soloader(struct tm* _Nonnull);
+
 __END_DECLS
 
 #endif

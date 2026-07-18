@@ -9,7 +9,7 @@
 
 /**
  * @file  dialog.h
- * @brief Common dialog for error messages and cheats input.
+ * @brief Common dialog helpers for text input and error messages.
  */
 
 #ifndef SOLOADER_DIALOG_H
@@ -26,6 +26,9 @@ char *get_ime_dialog_result(void);
 int init_msg_dialog(const char *msg);
 
 int get_msg_dialog_result(void);
+
+/** Displays the startup version picker and returns 337, 407, or 0 on cancel. */
+int select_btd5_version_dialog(void);
 
 void fatal_error(const char *fmt, ...) __attribute__((noreturn));
 

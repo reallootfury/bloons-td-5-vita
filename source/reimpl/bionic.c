@@ -3,6 +3,12 @@
 #include <errno.h>
 #include <math.h>
 #include <stddef.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <malloc.h>
+#include <sys/select.h>
 
 int bionic_fpclassifyd(double value) { return fpclassify(value); }
 int bionic_isfinite(double value) { return isfinite(value); }
@@ -99,3 +105,86 @@ int bionic_dup2(int oldfd, int newfd) {
 
 void bionic_flockfile(void *stream) { (void)stream; }
 void bionic_funlockfile(void *stream) { (void)stream; }
+
+void bionic_FD_SET_chk(int fd, void *set, size_t set_size) {
+    if (!set || fd < 0 || (size_t)fd >= set_size * 8u) {
+        return;
+    }
+    FD_SET(fd, (fd_set *)set);
+}
+
+size_t bionic_strlen_chk(const char *value, size_t bound) {
+    if (!value) return 0;
+    size_t length = strnlen(value, bound);
+    return length;
+}
+
+int bionic_vsnprintf_chk(char *output, size_t output_size, int flags,
+                         size_t destination_size, const char *format,
+                         va_list args) {
+    (void)flags;
+    if (output_size > destination_size) output_size = destination_size;
+    return vsnprintf(output, output_size, format, args);
+}
+
+int bionic_epoll_create1(int flags) {
+    (void)flags;
+    errno = ENOSYS;
+    return -1;
+}
+
+int bionic_eventfd(unsigned int initial_value, int flags) {
+    (void)initial_value; (void)flags;
+    errno = ENOSYS;
+    return -1;
+}
+
+int bionic_link(const char *old_path, const char *new_path) {
+    (void)old_path; (void)new_path;
+    errno = ENOSYS;
+    return -1;
+}
+
+int bionic_posix_memalign(void **result, size_t alignment, size_t size) {
+    if (!result || alignment < sizeof(void *) || (alignment & (alignment - 1)))
+        return EINVAL;
+    void *memory = memalign(alignment, size);
+    if (!memory) return ENOMEM;
+    *result = memory;
+    return 0;
+}
+
+ssize_t bionic_readlink(const char *path, char *buffer, size_t size) {
+    (void)path; (void)buffer; (void)size;
+    errno = ENOSYS;
+    return -1;
+}
+
+int bionic_statfs(const char *path, void *buffer) {
+    (void)path; (void)buffer;
+    errno = ENOSYS;
+    return -1;
+}
+
+long double bionic_strtold_l(const char *value, char **end, void *locale) {
+    (void)locale;
+    return strtold(value, end);
+}
+
+long long bionic_strtoll_l(const char *value, char **end, int base,
+                           void *locale) {
+    (void)locale;
+    return strtoll(value, end, base);
+}
+
+unsigned long long bionic_strtoull_l(const char *value, char **end, int base,
+                                     void *locale) {
+    (void)locale;
+    return strtoull(value, end, base);
+}
+
+int bionic_symlink(const char *target, const char *link_path) {
+    (void)target; (void)link_path;
+    errno = ENOSYS;
+    return -1;
+}

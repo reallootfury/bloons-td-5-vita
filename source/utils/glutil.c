@@ -12,6 +12,8 @@
 #include "utils/utils.h"
 #include "utils/dialog.h"
 #include "utils/logger.h"
+#include "utils/settings.h"
+#include "game.h"
 
 #include <stdio.h>
 #include <malloc.h>
@@ -19,6 +21,29 @@
 #include <psp2/kernel/sysmem.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/io/stat.h>
+
+#include <so_util/so_util.h>
+
+extern so_module so_mod;
+
+static bool gl_initialized = false;
+static unsigned int shader_compile_count;
+static unsigned int program_link_count;
+static unsigned int gl_finish_count;
+static unsigned int gl_flush_count;
+static unsigned long long gl_array_draw_calls;
+static unsigned long long gl_element_draw_calls;
+static unsigned long long gl_array_vertices;
+static unsigned long long gl_element_indices;
+
+static unsigned int game_address_offset(const void *address) {
+    uintptr_t value = (uintptr_t)address;
+    if (value >= so_mod.text_base &&
+        value < so_mod.text_base + so_mod.text_size) {
+        return (unsigned int)(value - so_mod.text_base);
+    }
+    return 0xffffffffu;
+}
 
 // Helpers for our handling of shaders
 GLboolean skip_next_compile = GL_FALSE;
@@ -32,19 +57,68 @@ void gl_preload() {
                     "Google \"ShaRKBR33D\" for quick installation.");
     }
 
+    if (settings_low_graphics_applied()) {
+        /* Keep the display at its known-good native mode. Let ShaRK optimize
+         * the translated shaders more aggressively instead of relying on an
+         * unsupported intermediate framebuffer size. */
+        vglSetupRuntimeShaderCompiler(SHARK_OPT_FAST, SHARK_ENABLE,
+                                      SHARK_ENABLE, SHARK_ENABLE);
+        l_info("Low Graphics: native 960x544 with fast shader optimization.");
+    }
+
 #ifdef USE_GLSL_SHADERS
     vglSetSemanticBindingMode(VGL_MODE_POSTPONED);
 #endif
 }
 
 void gl_init() {
+    if (gl_initialized)
+        return;
+
     // BTD5 is a 2D title and its EGL config reports no multisampling. Avoiding
     // 4x MSAA also leaves substantially more graphics memory for game assets.
-    vglInitExtended(0, 960, 544, 6 * 1024 * 1024, SCE_GXM_MULTISAMPLE_NONE);
+    int width = settings_render_width();
+    int height = settings_render_height();
+    l_info("Initializing VitaGL at %dx%d (Low Graphics %s).", width, height,
+           settings_low_graphics_applied() ? "ON" : "OFF");
+    vglInitExtended(0, width, height, 6 * 1024 * 1024,
+                    SCE_GXM_MULTISAMPLE_NONE);
+    gl_initialized = true;
 }
 
 void gl_swap() {
     vglSwapBuffers(GL_FALSE);
+}
+
+void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count) {
+    ++gl_array_draw_calls;
+    if (count > 0) {
+        gl_array_vertices += (unsigned long long)count;
+    }
+    glDrawArrays(mode, first, count);
+}
+
+void glDrawElements_soloader(GLenum mode, GLsizei count, GLenum type,
+                             const void *indices) {
+    ++gl_element_draw_calls;
+    if (count > 0) {
+        gl_element_indices += (unsigned long long)count;
+    }
+    glDrawElements(mode, count, type, indices);
+}
+
+void gl_take_draw_stats(GLDrawStats *stats) {
+    if (!stats) {
+        return;
+    }
+    stats->array_calls = gl_array_draw_calls;
+    stats->element_calls = gl_element_draw_calls;
+    stats->array_vertices = gl_array_vertices;
+    stats->element_indices = gl_element_indices;
+    gl_array_draw_calls = 0;
+    gl_element_draw_calls = 0;
+    gl_array_vertices = 0;
+    gl_element_indices = 0;
 }
 
 void glShaderSource_soloader(GLuint shader, GLsizei count,
@@ -100,11 +174,13 @@ void glCompileShader_soloader(GLuint shader) {
 
 #ifndef USE_GXP_SHADERS
     if (!skip_next_compile) {
+        unsigned int sequence = ++shader_compile_count;
         uint64_t compile_start = sceKernelGetProcessTimeWide();
 #ifdef DUMP_COMPILED_SHADERS
         l_info("Compiling uncached shader: %s", next_shader_fname);
 #else
-        l_info("Compiling GLSL shader.");
+        l_info("Compiling GLSL shader #%u from SO+0x%08x.", sequence,
+               game_address_offset(__builtin_return_address(0)));
 #endif
         glCompileShader(shader);
         uint64_t compile_ms =
@@ -131,12 +207,43 @@ void glCompileShader_soloader(GLuint shader) {
 #endif
 }
 
+void glLinkProgram_soloader(GLuint program) {
+    unsigned int sequence = ++program_link_count;
+    l_warn("Entering glLinkProgram #%u (program %u) from SO+0x%08x.",
+           sequence, program,
+           game_address_offset(__builtin_return_address(0)));
+    log_flush();
+    glLinkProgram(program);
+    l_warn("glLinkProgram #%u returned.", sequence);
+    log_flush();
+}
+
+void glFinish_soloader(void) {
+    unsigned int sequence = ++gl_finish_count;
+    l_warn("Entering glFinish #%u from SO+0x%08x.", sequence,
+           game_address_offset(__builtin_return_address(0)));
+    log_flush();
+    glFinish();
+    l_warn("glFinish #%u returned.", sequence);
+    log_flush();
+}
+
+void glFlush_soloader(void) {
+    unsigned int sequence = ++gl_flush_count;
+    l_warn("Entering glFlush #%u from SO+0x%08x.", sequence,
+           game_address_offset(__builtin_return_address(0)));
+    log_flush();
+    glFlush();
+    l_warn("glFlush #%u returned.", sequence);
+    log_flush();
+}
+
 #if defined(USE_GLSL_SHADERS) && defined(DUMP_COMPILED_SHADERS)
 void load_shader(GLuint shader, const char * string, size_t length) {
     char* sha_name = str_sha1sum(string, length);
 
     char gxp_path[256];
-    snprintf(gxp_path, sizeof(gxp_path), DATA_PATH"gxp/%s.gxp", sha_name);
+    snprintf(gxp_path, sizeof(gxp_path), "%sgxp/%s.gxp", btd5_data_path(), sha_name);
 
     bool cache_loaded = false;
     if (file_exists(gxp_path)) {
@@ -171,8 +278,8 @@ void load_shader(GLuint shader, const char * string, size_t length) {
 
     char gxp_path[256];
     char cg_path[256];
-    snprintf(gxp_path, sizeof(gxp_path), DATA_PATH"gxp/%s.gxp", sha_name);
-    snprintf(cg_path, sizeof(cg_path), DATA_PATH"cg/%s.cg", sha_name);
+    snprintf(gxp_path, sizeof(gxp_path), "%sgxp/%s.gxp", btd5_data_path(), sha_name);
+    snprintf(cg_path, sizeof(cg_path), "%scg/%s.cg", btd5_data_path(), sha_name);
 
     bool cache_loaded = false;
     if (file_exists(gxp_path)) {
@@ -206,7 +313,7 @@ void load_shader(GLuint shader, const char * string, size_t length) {
                "and using a dummy shader.", sha_name);
 
         char glsl_path[256];
-        snprintf(glsl_path, sizeof(glsl_path), DATA_PATH"glsl/%s.glsl", sha_name);
+        snprintf(glsl_path, sizeof(glsl_path), "%sglsl/%s.glsl", btd5_data_path(), sha_name);
         file_mkpath(glsl_path, 0777);
         file_save(glsl_path, (const uint8_t *) string, length);
 
@@ -231,9 +338,9 @@ void load_shader(GLuint shader, const char * string, size_t length) {
 
     char path[256];
 #ifdef USE_CG_SHADERS
-    snprintf(path, sizeof(path), DATA_PATH"cg/%s.cg", sha_name);
+    snprintf(path, sizeof(path), "%scg/%s.cg", btd5_data_path(), sha_name);
 #else
-    snprintf(path, sizeof(path), DATA_PATH"gxp/%s.gxp", sha_name);
+    snprintf(path, sizeof(path), "%sgxp/%s.gxp", btd5_data_path(), sha_name);
 #endif
 
     if (file_exists(path)) {
@@ -261,7 +368,7 @@ void load_shader(GLuint shader, const char * string, size_t length) {
                "and using a dummy shader.", sha_name);
 
         char glsl_path[256];
-        snprintf(glsl_path, sizeof(glsl_path), DATA_PATH"glsl/%s.glsl", sha_name);
+        snprintf(glsl_path, sizeof(glsl_path), "%sglsl/%s.glsl", btd5_data_path(), sha_name);
         file_mkpath(glsl_path, 0777);
         file_save(glsl_path, (const uint8_t *) string, length);
 

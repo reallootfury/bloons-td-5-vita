@@ -27,12 +27,16 @@ extern "C" {
 
 #ifdef DEBUG_SOLOADER
 #define l_debug(...)   _log_print(LT_DEBUG,   __VA_ARGS__)
+#else
+#define l_debug(...)
+#endif
+
+#if defined(DEBUG_SOLOADER) || defined(BTD5_RUNTIME_LOGGING)
 #define l_info(...)    _log_print(LT_INFO,    __VA_ARGS__)
 #define l_warn(...)    _log_print(LT_WARN,    __VA_ARGS__)
 #define l_success(...) _log_print(LT_SUCCESS, __VA_ARGS__)
 #define l_wait(...)    _log_print(LT_WAIT,    __VA_ARGS__)
 #else
-#define l_debug(...)
 #define l_info(...)
 #define l_warn(...)
 #define l_success(...)

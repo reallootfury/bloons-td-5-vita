@@ -17,7 +17,6 @@
 #include <stdint.h>
 
 #define LEFT_ANALOG_DEADZONE  0.16f
-#define RIGHT_ANALOG_DEADZONE 0.16f
 
 typedef enum ControlsAction {
     CONTROLS_ACTION_UP = 0,
@@ -34,34 +33,14 @@ typedef enum ControlsStickId {
 extern void controls_handler_key(int32_t keycode, ControlsAction action);
 extern void controls_handler_touch(int32_t id, float x, float y, ControlsAction action);
 extern void controls_handler_analog(ControlsStickId which, float x, float y, ControlsAction action);
+extern void controls_handler_exit_request(void);
 
 enum {
     AKEYCODE_BACK = 4,
-    AKEYCODE_DPAD_UP = 19,
-    AKEYCODE_DPAD_DOWN = 20,
-    AKEYCODE_DPAD_LEFT = 21,
-    AKEYCODE_DPAD_RIGHT = 22,
-    AKEYCODE_DPAD_CENTER = 23,
-    AKEYCODE_A = 29,
-    AKEYCODE_B = 30,
-    AKEYCODE_BUTTON_A = 96,
-    AKEYCODE_BUTTON_B = 97,
-    AKEYCODE_BUTTON_X = 99,
-    AKEYCODE_BUTTON_Y = 100,
-    AKEYCODE_BUTTON_L1 = 102,
-    AKEYCODE_BUTTON_R1 = 103,
-    AKEYCODE_BUTTON_START = 108,
-    AKEYCODE_BUTTON_SELECT = 109,
 };
-
-typedef struct {
-    uint32_t sce_button;
-    uint32_t android_button;
-} ButtonMapping;
 
 void controls_init();
 void controls_poll();
 void controls_draw_cursor(void);
-bool controls_consume_ingame_debug_modifier(void);
 
 #endif // SOLOADER_CONTROLS_H

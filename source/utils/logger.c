@@ -26,6 +26,7 @@
 
 static SceKernelLwMutexWork _log_mutex;
 static atomic_bool _log_mutex_ready = ATOMIC_VAR_INIT(false);
+static atomic_bool _log_file_enabled = ATOMIC_VAR_INIT(false);
 static SceUID _log_file = -2;
 
 // Buffer A is used to adjust the format string.
@@ -33,7 +34,21 @@ static char buffer_a[2048];
 // Buffer B is used to compile the final log using the updated format string.
 static char buffer_b[2048];
 
+static bool packaged_log_enabled(void) {
+    char value = '0';
+    SceUID fd = sceIoOpen("app0:/loader_logging.cfg", SCE_O_RDONLY, 0);
+    if (fd < 0) {
+        return false;
+    }
+    int bytes_read = sceIoRead(fd, &value, 1);
+    sceIoClose(fd);
+    return bytes_read == 1 && value == '1';
+}
+
 static void log_file_write_unlocked(const char *message) {
+    if (!atomic_load_explicit(&_log_file_enabled, memory_order_relaxed)) {
+        return;
+    }
     if (_log_file == -2) {
         _log_file = sceIoOpen(DATA_PATH "loader.log",
                               SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
@@ -44,9 +59,7 @@ static void log_file_write_unlocked(const char *message) {
                                   SCE_O_WRONLY | SCE_O_CREAT | SCE_O_APPEND,
                                   0666);
         }
-        if (_log_file >= 0) {
-            sceIoSyncByFd(_log_file, 0);
-        } else {
+        if (_log_file < 0) {
             sceClibPrintf("Persistent loader log open failed: 0x%x\n", _log_file);
         }
     }
@@ -56,23 +69,35 @@ static void log_file_write_unlocked(const char *message) {
 }
 
 void log_start_session(void) {
+    bool enabled = packaged_log_enabled();
+    atomic_store_explicit(&_log_file_enabled, enabled, memory_order_release);
+
+    /* A diagnostic log is useful per boot, but appending every frame from
+     * every historical boot eventually consumes megabytes.  The loader is
+     * the only writer and calls this before any other logging, so discard the
+     * previous session first. */
+    sceIoRemove(DATA_PATH "loader.log");
+    sceIoRemove("ux0:/data/btd5/loader.log");
+    if (!enabled) {
+        return;
+    }
     log_write_raw("\n=== Bloons TD 5 Vita loader session ===\n");
     log_flush();
 }
 
 void log_flush(void) {
-    if (!atomic_load_explicit(&_log_mutex_ready, memory_order_relaxed)) {
+    if (!atomic_load_explicit(&_log_file_enabled, memory_order_relaxed)) {
         return;
     }
-    sceKernelLockLwMutex(&_log_mutex, 1, NULL);
-    if (_log_file >= 0) {
-        sceIoSyncByFd(_log_file, 0);
-    }
-    sceKernelUnlockLwMutex(&_log_mutex, 1);
+    /* Messages are written directly with sceIoWrite. Keep this API as a
+     * synchronization boundary for callers, but do not issue a full storage
+     * flush while BTD5/FIOS is actively streaming startup assets. */
+    atomic_thread_fence(memory_order_seq_cst);
 }
 
 void log_write_raw(const char *message) {
-    if (!message) {
+    if (!message ||
+        !atomic_load_explicit(&_log_file_enabled, memory_order_acquire)) {
         return;
     }
     if (!atomic_load_explicit(&_log_mutex_ready, memory_order_relaxed)) {
@@ -88,6 +113,11 @@ void log_write_raw(const char *message) {
 }
 
 void _log_print(int t, const char* fmt, ...) {
+    bool file_enabled = atomic_load_explicit(&_log_file_enabled,
+                                             memory_order_acquire);
+    if (!file_enabled && t != LT_ERROR && t != LT_FATAL) {
+        return;
+    }
     if (!atomic_load_explicit(&_log_mutex_ready, memory_order_relaxed)) {
         int ret = sceKernelCreateLwMutex(&_log_mutex, "log_lock", 0, 0, NULL);
         if (ret < 0) {
@@ -133,9 +163,8 @@ void _log_print(int t, const char* fmt, ...) {
     va_end(list);
     sceClibPrintf(buffer_b);
 
-    // VitaShell's debug output is not always available on a first test run.
-    // Keep a persistent copy next to the user-supplied data so crash reports
-    // can be retrieved over USB/FTP afterwards.
+    /* The logging package keeps a persistent copy next to the user-supplied
+     * data. The standard package retains only error/fatal console output. */
     log_file_write_unlocked(buffer_b);
 
     if (atomic_load_explicit(&_log_mutex_ready, memory_order_relaxed)) {

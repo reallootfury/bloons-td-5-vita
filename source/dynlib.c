@@ -135,6 +135,7 @@ extern const short *BIONIC_toupper_tab_;
 static FILE __sF_fake[3];
 
 void *dlsym_soloader(void * handle, const char * symbol);
+void *dlopen_soloader(const char *filename, int flags);
 
 so_default_dynlib default_dynlib[] = {
         // Common C/C++ internals
@@ -282,8 +283,22 @@ so_default_dynlib default_dynlib[] = {
         // Android/Bionic compatibility fallbacks
         { "dladdr", (uintptr_t)&bionic_dladdr },
         { "epoll_create", (uintptr_t)&bionic_epoll_create },
+        { "epoll_create1", (uintptr_t)&bionic_epoll_create1 },
         { "epoll_ctl", (uintptr_t)&bionic_epoll_ctl },
         { "epoll_wait", (uintptr_t)&bionic_epoll_wait },
+        { "eventfd", (uintptr_t)&bionic_eventfd },
+        { "__FD_SET_chk", (uintptr_t)&bionic_FD_SET_chk },
+        { "__strlen_chk", (uintptr_t)&bionic_strlen_chk },
+        { "__vsnprintf_chk", (uintptr_t)&bionic_vsnprintf_chk },
+        { "link", (uintptr_t)&bionic_link },
+        { "posix_memalign", (uintptr_t)&bionic_posix_memalign },
+        { "readlink", (uintptr_t)&bionic_readlink },
+        { "signal", (uintptr_t)&signal },
+        { "statfs", (uintptr_t)&bionic_statfs },
+        { "strtold_l", (uintptr_t)&bionic_strtold_l },
+        { "strtoll_l", (uintptr_t)&bionic_strtoll_l },
+        { "strtoull_l", (uintptr_t)&bionic_strtoull_l },
+        { "symlink", (uintptr_t)&bionic_symlink },
         { "execl", (uintptr_t)&bionic_execl },
         { "getegid", (uintptr_t)&bionic_getegid },
         { "geteuid", (uintptr_t)&bionic_geteuid },
@@ -643,8 +658,8 @@ so_default_dynlib default_dynlib[] = {
         { "glDisable", (uintptr_t)&glDisable },
         { "glDisableClientState", (uintptr_t)&glDisableClientState },
         { "glDisableVertexAttribArray", (uintptr_t)&glDisableVertexAttribArray },
-        { "glDrawArrays", (uintptr_t)&glDrawArrays },
-        { "glDrawElements", (uintptr_t)&glDrawElements },
+        { "glDrawArrays", (uintptr_t)&glDrawArrays_soloader },
+        { "glDrawElements", (uintptr_t)&glDrawElements_soloader },
         { "glDrawTexfOES", (uintptr_t)&ret0 },
         { "glDrawTexfvOES", (uintptr_t)&ret0 },
         { "glDrawTexiOES", (uintptr_t)&ret0 },
@@ -658,8 +673,8 @@ so_default_dynlib default_dynlib[] = {
         { "glEnable", (uintptr_t)&glEnable },
         { "glEnableClientState", (uintptr_t)&glEnableClientState },
         { "glEnableVertexAttribArray", (uintptr_t)&glEnableVertexAttribArray },
-        { "glFinish", (uintptr_t)&glFinish },
-        { "glFlush", (uintptr_t)&glFlush },
+        { "glFinish", (uintptr_t)&glFinish_soloader },
+        { "glFlush", (uintptr_t)&glFlush_soloader },
         { "glFogf", (uintptr_t)&glFogf },
         { "glFogfv", (uintptr_t)&glFogfv },
         { "glFogx", (uintptr_t)&glFogx },
@@ -731,7 +746,7 @@ so_default_dynlib default_dynlib[] = {
         { "glLightxv", (uintptr_t)&glLightxv },
         { "glLineWidth", (uintptr_t)&glLineWidth },
         { "glLineWidthx", (uintptr_t)&glLineWidthx },
-        { "glLinkProgram", (uintptr_t)&glLinkProgram },
+        { "glLinkProgram", (uintptr_t)&glLinkProgram_soloader },
         { "glLoadIdentity", (uintptr_t)&glLoadIdentity },
         { "glLoadMatrixf", (uintptr_t)&glLoadMatrixf },
         { "glLoadMatrixx", (uintptr_t)&glLoadMatrixx },
@@ -961,7 +976,7 @@ so_default_dynlib default_dynlib[] = {
         // libdl
         { "dlclose", (uintptr_t)&ret0 },
         { "dlerror", (uintptr_t)&ret0 },
-        { "dlopen", (uintptr_t)&ret1 },
+        { "dlopen", (uintptr_t)&dlopen_soloader },
         { "dlsym", (uintptr_t)&dlsym_soloader },
 
 
@@ -1017,14 +1032,14 @@ so_default_dynlib default_dynlib[] = {
         { "clock_gettime", (uintptr_t)&clock_gettime_soloader },
         { "difftime", (uintptr_t)&difftime },
         { "gettimeofday", (uintptr_t)&gettimeofday },
-        { "gmtime", (uintptr_t)&gmtime },
+        { "gmtime", (uintptr_t)&gmtime_soloader },
         { "gmtime64", (uintptr_t)&gmtime64 },
-        { "gmtime_r", (uintptr_t)&gmtime_r },
-        { "localtime", (uintptr_t)&localtime },
-        { "localtime64", (uintptr_t)&localtime64 },
-        { "localtime_r", (uintptr_t)&localtime_r },
-        { "mktime", (uintptr_t)&mktime },
-        { "mktime64", (uintptr_t)&mktime64 },
+        { "gmtime_r", (uintptr_t)&gmtime_r_soloader },
+        { "localtime", (uintptr_t)&localtime_soloader },
+        { "localtime64", (uintptr_t)&gmtime64 },
+        { "localtime_r", (uintptr_t)&localtime_r_soloader },
+        { "mktime", (uintptr_t)&mktime_soloader },
+        { "mktime64", (uintptr_t)&timegm64 },
         { "nanosleep", (uintptr_t)&nanosleep },
         { "strftime", (uintptr_t)&strftime },
         { "time", (uintptr_t)&time },
@@ -1119,14 +1134,35 @@ so_default_dynlib default_dynlib[] = {
 };
 
 void *dlsym_soloader(void * handle, const char * symbol) {
+    (void)handle;
     for (int i = 0; i < sizeof(default_dynlib) / sizeof(default_dynlib[0]); i++) {
         if (strcmp(symbol, default_dynlib[i].symbol) == 0) {
-            return &default_dynlib[i].func;
+            /* dlsym returns the symbol value, not the address of the loader's
+             * lookup-table slot. */
+            return (void *)default_dynlib[i].func;
         }
     }
 
     l_error("dlsym: Unknown symbol \"%s\".", symbol);
     return NULL;
+}
+
+void *dlopen_soloader(const char *filename, int flags) {
+    (void)flags;
+
+    /* Crashlytics is an optional companion library in the Android APK and is
+     * not shipped with the Vita data.  Claiming every dlopen succeeds makes
+     * BTD5 enter the plugin path and then receive NULL for
+     * external_api_initialize, which is not how Android behaves when the
+     * library itself is absent. */
+    if (filename && strstr(filename, "libcrashlytics.so")) {
+        l_info("Optional Crashlytics library is unavailable; analytics disabled.");
+        return NULL;
+    }
+
+    /* Preserve the loader's existing pseudo-handle for libraries whose
+     * imports are supplied by the static bridge. */
+    return (void *)1;
 }
 
 void resolve_imports(so_module* mod) {

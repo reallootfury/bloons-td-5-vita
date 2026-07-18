@@ -29,6 +29,26 @@ void gl_swap();
 
 void glCompileShader_soloader(GLuint shader);
 
+void glLinkProgram_soloader(GLuint program);
+
+void glFinish_soloader(void);
+
+void glFlush_soloader(void);
+
+void glDrawArrays_soloader(GLenum mode, GLint first, GLsizei count);
+
+void glDrawElements_soloader(GLenum mode, GLsizei count, GLenum type,
+                             const void *indices);
+
+typedef struct GLDrawStats {
+    unsigned long long array_calls;
+    unsigned long long element_calls;
+    unsigned long long array_vertices;
+    unsigned long long element_indices;
+} GLDrawStats;
+
+void gl_take_draw_stats(GLDrawStats *stats);
+
 void glShaderSource_soloader(GLuint shader, GLsizei count,
                              const GLchar **string, const GLint *_length);
 

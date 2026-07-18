@@ -21,6 +21,7 @@
 #include "reimpl/controls.h"
 #include "diagnostics.h"
 #include "utils/logger.h"
+#include "game.h"
 
 extern so_module so_mod;
 
@@ -40,36 +41,11 @@ extern so_module so_mod;
 #define BTD5_PRESENT_OFFSET         0x004fb17cu
 #define BTD5_RENDER_CORE_OFFSET     0x004d1d2cu
 #define BTD5_RENDER_OVERLAY_OFFSET  0x00238a88u
-/* CInGameUI::onActorActivated. Its existing debug branch compares the event
- * actor with this+0x270, looks up "InGameDebug" through the normal screen
- * registry, and toggles the panel's visibility flag. */
-#define BTD5_INGAME_UI_EVENT_OFFSET 0x003ba7c8u
-#define BTD5_SCREEN_LOOKUP_OFFSET    0x004db3b8u
-#define BTD5_CBASESCREEN_RTTI        0x00944540u
-#define BTD5_CINGAMEDEBUG_RTTI       0x0093cca0u
-#define BTD5_INGAME_DEBUG_VISIBLE    0x14cu
-
 static so_hook tick_update_hook;
 static so_hook tick_post_frame_hook;
 static so_hook present_hook;
 static so_hook render_core_hook;
 static so_hook render_overlay_hook;
-static so_hook ingame_ui_event_hook;
-
-extern void *__dynamic_cast(const void *object, const void *source_type,
-                            const void *target_type, ptrdiff_t source_offset);
-
-/* BTD5 3.37 uses the old 32-bit libc++ long-string representation. The
- * dormant debug branch builds exactly this 12-byte object for
- * "InGameDebug" before asking its screen registry for CBaseScreen*. */
-typedef struct BTD5LongString {
-    uint32_t capacity;
-    uint32_t size;
-    const char *data;
-} BTD5LongString;
-
-typedef void *(*BTD5ScreenLookup)(void *screen_registry,
-                                  const BTD5LongString *name);
 
 static uintptr_t tick_update_diagnostic(void *engine) {
     btd5_diag_set_stage(BTD5_STAGE_UPDATE);
@@ -104,60 +80,8 @@ static uintptr_t render_overlay_diagnostic(void *engine) {
     return result;
 }
 
-static int toggle_ingame_debug_panel(void *ingame_ui) {
-    static const char debug_name[] = "InGameDebug";
-    BTD5LongString name = {
-        .capacity = 17,
-        .size = sizeof(debug_name) - 1,
-        .data = debug_name,
-    };
-
-    void *screen_registry = *(void **)((uintptr_t)ingame_ui + 0x1cu);
-    if (!screen_registry) {
-        l_warn("InGameDebug screen registry is unavailable.");
-        return -1;
-    }
-
-    BTD5ScreenLookup lookup = (BTD5ScreenLookup)(
-        (so_mod.text_base + BTD5_SCREEN_LOOKUP_OFFSET) | 1u);
-    void *base_screen = lookup(screen_registry, &name);
-    if (!base_screen) {
-        l_warn("InGameDebug is not registered in the current match.");
-        return -1;
-    }
-
-    void *debug_screen = __dynamic_cast(
-        base_screen,
-        (const void *)(so_mod.text_base + BTD5_CBASESCREEN_RTTI),
-        (const void *)(so_mod.text_base + BTD5_CINGAMEDEBUG_RTTI), 0);
-    if (!debug_screen) {
-        l_warn("InGameDebug screen cast failed.");
-        return -1;
-    }
-
-    uint8_t *visible = (uint8_t *)debug_screen + BTD5_INGAME_DEBUG_VISIBLE;
-    *visible ^= 1u;
-    l_info("InGameDebug panel visibility set to %u.", (unsigned)*visible);
-    return *visible;
-}
-
-static uintptr_t ingame_ui_event_debug_modifier(void *ingame_ui,
-                                                 void *event_actor) {
-    if (controls_consume_ingame_debug_modifier()) {
-        int visible = toggle_ingame_debug_panel(ingame_ui);
-        log_flush();
-        if (visible >= 0) {
-            /* Consume the modified UI activation. The game's original debug
-             * branch also returns immediately after toggling this byte. */
-            return (uintptr_t)visible;
-        }
-    }
-
-    return SO_CONTINUE(uintptr_t, ingame_ui_event_hook, ingame_ui,
-                       event_actor);
-}
-
-static void install_tick_diagnostics(void) {
+static void install_version_337_hooks(void) {
+#ifdef DEBUG_SOLOADER
     tick_update_hook = hook_addr(
         (so_mod.text_base + BTD5_TICK_UPDATE_OFFSET) | 1u,
         (uintptr_t)&tick_update_diagnostic);
@@ -173,11 +97,8 @@ static void install_tick_diagnostics(void) {
     render_overlay_hook = hook_addr(
         (so_mod.text_base + BTD5_RENDER_OVERLAY_OFFSET) | 1u,
         (uintptr_t)&render_overlay_diagnostic);
-    ingame_ui_event_hook = hook_addr(
-        (so_mod.text_base + BTD5_INGAME_UI_EVENT_OFFSET) | 1u,
-        (uintptr_t)&ingame_ui_event_debug_modifier);
     l_info("Installed nativeTick internal stage diagnostics.");
-    l_info("Installed registry-based InGameDebug panel hook.");
+#endif
 }
 
 static void patch_kuser_helpers(void) {
@@ -186,9 +107,9 @@ static void patch_kuser_helpers(void) {
     unsigned int cmpxchg_count = 0;
     unsigned int barrier_count = 0;
 
-    for (size_t offset = 0; offset + sizeof(uint32_t) <= so_mod.text_size;
+    for (size_t offset = 0; offset + sizeof(uint32_t) <= so_mod.exec_size;
          offset += sizeof(uint32_t)) {
-        uintptr_t address = so_mod.text_base + offset;
+        uintptr_t address = so_mod.exec_base + offset;
         uint32_t value = *(const uint32_t *)address;
         uintptr_t replacement = 0;
 
@@ -214,6 +135,12 @@ static void patch_kuser_helpers(void) {
 }
 
 void so_patch(void) {
-    patch_kuser_helpers();
-    install_tick_diagnostics();
+    if (btd5_game_version() == BTD5_VERSION_337) {
+        patch_kuser_helpers();
+        install_version_337_hooks();
+    } else {
+        /* 4.7 was rebuilt with modern atomics and has no Linux kuser literal
+         * calls. Keep it on named exports/imports only. */
+        l_info("BTD5 4.7 detected: no version-specific patches required.");
+    }
 }

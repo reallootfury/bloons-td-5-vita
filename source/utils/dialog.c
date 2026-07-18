@@ -8,6 +8,7 @@
  */
 
 #include "utils/dialog.h"
+#include "utils/glutil.h"
 
 #include <psp2/ctrl.h>
 #include <psp2/ime_dialog.h>
@@ -123,6 +124,49 @@ int get_msg_dialog_result(void) {
     return 1;
 }
 
+int select_btd5_version_dialog(void) {
+    SceMsgDialogButtonsParam buttons;
+    sceClibMemset(&buttons, 0, sizeof(buttons));
+    buttons.msg1 = "BTD5 3.37";
+    buttons.fontSize1 = SCE_MSG_DIALOG_FONT_SIZE_DEFAULT;
+    buttons.msg2 = "BTD5 4.7";
+    buttons.fontSize2 = SCE_MSG_DIALOG_FONT_SIZE_DEFAULT;
+    buttons.msg3 = "Cancel";
+    buttons.fontSize3 = SCE_MSG_DIALOG_FONT_SIZE_DEFAULT;
+
+    SceMsgDialogUserMessageParam msg_param;
+    sceClibMemset(&msg_param, 0, sizeof(msg_param));
+    msg_param.buttonType = SCE_MSG_DIALOG_BUTTON_TYPE_3BUTTONS;
+    msg_param.msg = (SceChar8 *)"Choose the Bloons TD 5 version to boot.";
+    msg_param.buttonParam = &buttons;
+
+    SceMsgDialogParam param;
+    sceMsgDialogParamInit(&param);
+    param.mode = SCE_MSG_DIALOG_MODE_USER_MSG;
+    param.userMsgParam = &msg_param;
+
+    gl_init();
+    if (sceMsgDialogInit(&param) < 0)
+        return 0;
+
+    while (sceMsgDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_FINISHED)
+        vglSwapBuffers(GL_TRUE);
+
+    SceMsgDialogResult result;
+    sceClibMemset(&result, 0, sizeof(result));
+    if (sceMsgDialogGetResult(&result) < 0) {
+        sceMsgDialogTerm();
+        return 0;
+    }
+    sceMsgDialogTerm();
+
+    if (result.buttonId == SCE_MSG_DIALOG_BUTTON_ID_BUTTON1)
+        return 337;
+    if (result.buttonId == SCE_MSG_DIALOG_BUTTON_ID_BUTTON2)
+        return 407;
+    return 0;
+}
+
 void fatal_error(const char *fmt, ...) {
     va_list list;
     char string[512];
@@ -131,7 +175,7 @@ void fatal_error(const char *fmt, ...) {
     sceClibVsnprintf(string, sizeof(string), fmt, list);
     va_end(list);
 
-    vglInit(0);
+    gl_init();
 
     init_msg_dialog(string);
 
