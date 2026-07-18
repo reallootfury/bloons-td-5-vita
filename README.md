@@ -53,7 +53,7 @@ An unofficial PlayStation Vita loader for the Android ARMv7 release of
 
 - [`kubridge.skprx`](https://github.com/bythos14/kubridge).
 - `libshacccg.suprx`, normally installed with
-  [ShaRKBR33D](https://github.com/OsirizX/ShaRKBR33D).
+  [ShaRKBR33D]((https://github.com/Rinnegatamante/ShaRKBR33D)).
 
 
 ### BTD5 3.37
