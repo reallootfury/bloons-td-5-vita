@@ -19,8 +19,8 @@ typedef struct so_module {
     struct so_module *next;
 
     SceUID patch_blockid, text_blockid, data_blockid[MAX_DATA_SEG];
-    uintptr_t patch_base, patch_head, cave_base, cave_head, text_base, data_base[MAX_DATA_SEG];
-    size_t patch_size, cave_size, text_size, data_size[MAX_DATA_SEG];
+    uintptr_t patch_base, patch_head, cave_base, cave_head, text_base, exec_base, data_base[MAX_DATA_SEG];
+    size_t patch_size, cave_size, text_size, exec_size, data_size[MAX_DATA_SEG];
     uintptr_t exidx_base;
     size_t exidx_count;
     int n_data;

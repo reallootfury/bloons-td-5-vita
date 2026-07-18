@@ -89,7 +89,7 @@ static codepoint_t decode_utf16(utf16_t const* utf16, size_t len, size_t* index)
 
     // BMP character
     if ((high & GENERIC_SURROGATE_MASK) != GENERIC_SURROGATE_VALUE)
-        return high; 
+        return high;
 
     // Unmatched low surrogate, invalid
     if ((high & SURROGATE_MASK) != HIGH_SURROGATE_VALUE)
@@ -98,7 +98,7 @@ static codepoint_t decode_utf16(utf16_t const* utf16, size_t len, size_t* index)
     // String ended with an unmatched high surrogate, invalid
     if (*index == len - 1)
         return INVALID_CODEPOINT;
-    
+
     utf16_t low = utf16[*index + 1];
 
     // Unmatched high surrogate, invalid
@@ -115,7 +115,7 @@ static codepoint_t decode_utf16(utf16_t const* utf16, size_t len, size_t* index)
     result <<= SURROGATE_CODEPOINT_BITS;
     result |= low & SURROGATE_CODEPOINT_MASK;
     result += SURROGATE_CODEPOINT_OFFSET;
-    
+
     // And if all else fails, it's valid
     return result;
 }
@@ -214,7 +214,7 @@ static codepoint_t decode_utf8(utf8_t const* utf8, size_t len, size_t* index)
     utf8_pattern leading_pattern;
     // If the leading byte matches the current leading pattern
     bool matches = false;
-    
+
     do
     {
         encoding_len++;

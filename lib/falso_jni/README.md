@@ -43,7 +43,7 @@ to your client application, like this:
 
 int main() {
     // ...
-    
+
     jni_init(); // Initializes jvm and jni objects
 
     int (*JNI_OnLoad)(JavaVM* jvm) = (void*)so_symbol(&so_mod,"JNI_OnLoad");
@@ -99,13 +99,13 @@ jint GetDisplayOrientationLock(jmethodID id, va_list args) { // I (ret type) is 
 // "GetUsername", "(Ljava/lang/String;)Ljava/lang/String;"
 jstring GetUsername(jmethodID id, va_list args) { // Ljava/lang/String; (ret type) is a jstring
     jstring _email = va_arg(args, jstring);
-    
+
     // If you want to work with Java strings, always use respective JNI methods!
     // They are NOT c-strings.
     const char * email = jni->GetStringUTFChars(&jni, _email, NULL);
     const char * username = MyCoolFunctionToLookupUsername(_email);
     jni->ReleaseStringUTFChars(&jni, _email, email);
-    
+
     return jni->NewStringUTF(&jni, username);
 }
 
@@ -131,7 +131,7 @@ from C arrays by always having the array size information with them, so
 FalsoJNI mimics Java arrays behavior with a special struct, **JavaDynArray**
 (or *jda* in short).
 
-Every time you receive an array of any kind as an argument, you have to get 
+Every time you receive an array of any kind as an argument, you have to get
 the "real", underlying array from it like shown in the example. You can also
 use `jda_sizeof(JavaDynArr *)` function to get the length of the array you
 are operating on.

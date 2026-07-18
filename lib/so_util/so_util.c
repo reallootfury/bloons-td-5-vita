@@ -112,12 +112,11 @@ so_hook hook_addr(uintptr_t addr, uintptr_t dst) {
 }
 
 void so_flush_caches(so_module *mod) {
-    kuKernelFlushCaches((void *)mod->text_base, mod->text_size);
+    kuKernelFlushCaches((void *)mod->exec_base, mod->exec_size);
 }
 
 int _so_load(so_module *mod, SceUID so_blockid, void *so_data, uintptr_t load_addr) {
     int res = 0;
-    uintptr_t data_addr = 0;
 
     if (memcmp(so_data, ELFMAG, SELFMAG) != 0) {
         res = -1;
@@ -130,87 +129,97 @@ int _so_load(so_module *mod, SceUID so_blockid, void *so_data, uintptr_t load_ad
 
     mod->shstr = (char *)((uintptr_t)so_data + mod->shdr[mod->ehdr->e_shstrndx].sh_offset);
 
+    /* text_base is the ELF load bias, not necessarily the first executable
+     * byte. Newer Android linkers emit a read-only PT_LOAD before a distinct
+     * executable PT_LOAD, while older BTD5 has one combined R|X segment. */
+    mod->text_base = load_addr;
+
+    mod->patch_size = PATCH_SZ;
+    SceKernelAllocMemBlockKernelOpt patch_opt;
+    memset(&patch_opt, 0, sizeof(patch_opt));
+    patch_opt.size = sizeof(patch_opt);
+    patch_opt.attr = 0x1;
+    patch_opt.field_C = (SceUInt32)load_addr - mod->patch_size;
+    res = mod->patch_blockid = kuKernelAllocMemBlock(
+        "patch_block", SCE_KERNEL_MEMBLOCK_TYPE_USER_RX,
+        mod->patch_size, &patch_opt);
+    if (res < 0)
+        goto err_free_so;
+    sceKernelGetMemBlockBase(mod->patch_blockid, (void **)&mod->patch_base);
+    mod->patch_head = mod->patch_base;
+
     for (int i = 0; i < mod->ehdr->e_phnum; i++) {
         if (mod->phdr[i].p_type == PT_LOAD) {
+            Elf32_Addr original_vaddr = mod->phdr[i].p_vaddr;
+            size_t alignment = mod->phdr[i].p_align;
+            if (alignment < 0x1000)
+                alignment = 0x1000;
+            uintptr_t page_vaddr = original_vaddr & ~(alignment - 1);
+            size_t page_delta = original_vaddr - page_vaddr;
+            size_t prog_size = ALIGN_MEM(page_delta + mod->phdr[i].p_memsz,
+                                         alignment);
+            uintptr_t requested_base = load_addr + page_vaddr;
+            void *block_base = NULL;
             void *prog_data;
-            size_t prog_size;
+
+            SceKernelAllocMemBlockKernelOpt opt;
+            memset(&opt, 0, sizeof(opt));
+            opt.size = sizeof(opt);
+            opt.attr = 0x1;
+            opt.field_C = (SceUInt32)requested_base;
 
             if ((mod->phdr[i].p_flags & PF_X) == PF_X) {
-                // Allocate arena for code patches, trampolines, etc
-                // Sits exactly under the desired allocation space
-                mod->patch_size = ALIGN_MEM(PATCH_SZ, mod->phdr[i].p_align);
-                SceKernelAllocMemBlockKernelOpt opt;
-                memset(&opt, 0, sizeof(SceKernelAllocMemBlockKernelOpt));
-                opt.size = sizeof(SceKernelAllocMemBlockKernelOpt);
-                opt.attr = 0x1;
-                opt.field_C = (SceUInt32)load_addr - mod->patch_size;
-                res = mod->patch_blockid = kuKernelAllocMemBlock("rx_block", SCE_KERNEL_MEMBLOCK_TYPE_USER_RX, mod->patch_size, &opt);
-                if (res < 0)
-                    goto err_free_so;
-
-                sceKernelGetMemBlockBase(mod->patch_blockid, (void **) &mod->patch_base);
-                mod->patch_head = mod->patch_base;
-
-                prog_size = ALIGN_MEM(mod->phdr[i].p_memsz, mod->phdr[i].p_align);
-                memset(&opt, 0, sizeof(SceKernelAllocMemBlockKernelOpt));
-                opt.size = sizeof(SceKernelAllocMemBlockKernelOpt);
-                opt.attr = 0x1;
-                opt.field_C = (SceUInt32)load_addr;
                 res = mod->text_blockid = kuKernelAllocMemBlock("rx_block", SCE_KERNEL_MEMBLOCK_TYPE_USER_RX, prog_size, &opt);
                 if (res < 0)
-                    goto err_free_so;
+                    goto err_free_data;
 
-                sceKernelGetMemBlockBase(mod->text_blockid, &prog_data);
-
-                mod->phdr[i].p_vaddr += (Elf32_Addr)prog_data;
-
-                mod->text_base = mod->phdr[i].p_vaddr;
-                mod->text_size = mod->phdr[i].p_memsz;
+                sceKernelGetMemBlockBase(mod->text_blockid, &block_base);
+                prog_data = (void *)((uintptr_t)block_base + page_delta);
+                mod->exec_base = (uintptr_t)prog_data;
+                mod->exec_size = mod->phdr[i].p_memsz;
 
                 // Use the .text segment padding as a code cave
                 // Word-align it to make it simpler for instruction arena allocation
-                mod->cave_size = ALIGN_MEM(prog_size - mod->phdr[i].p_memsz, 0x4);
-                mod->cave_base = mod->cave_head = (uintptr_t) prog_data + mod->phdr[i].p_memsz;
+                mod->cave_base = mod->cave_head =
+                    (uintptr_t)prog_data + mod->phdr[i].p_memsz;
                 mod->cave_base = ALIGN_MEM(mod->cave_base, 0x4);
                 mod->cave_head = mod->cave_base;
+                mod->cave_size = ((uintptr_t)block_base + prog_size) -
+                                 mod->cave_base;
                 sceClibPrintf("code cave: %d bytes (@0x%08X).\n", mod->cave_size, mod->cave_base);
-
-                data_addr = (uintptr_t)prog_data + prog_size;
             } else {
-                if (data_addr == 0)
-                    goto err_free_so;
-
                 if (mod->n_data >= MAX_DATA_SEG)
                     goto err_free_data;
-
-                prog_size = ALIGN_MEM(mod->phdr[i].p_memsz + mod->phdr[i].p_vaddr - (data_addr - mod->text_base), mod->phdr[i].p_align);
-
-                SceKernelAllocMemBlockKernelOpt opt;
-                memset(&opt, 0, sizeof(SceKernelAllocMemBlockKernelOpt));
-                opt.size = sizeof(SceKernelAllocMemBlockKernelOpt);
-                opt.attr = 0x1;
-                opt.field_C = (SceUInt32)data_addr;
                 res = mod->data_blockid[mod->n_data] = kuKernelAllocMemBlock("rw_block", SCE_KERNEL_MEMBLOCK_TYPE_USER_RW, prog_size, &opt);
                 if (res < 0)
-                    goto err_free_text;
+                    goto err_free_data;
 
-                sceKernelGetMemBlockBase(mod->data_blockid[mod->n_data], &prog_data);
-                data_addr = (uintptr_t)prog_data + prog_size;
-
-                mod->phdr[i].p_vaddr += (Elf32_Addr)mod->text_base;
-
-                mod->data_base[mod->n_data] = mod->phdr[i].p_vaddr;
+                sceKernelGetMemBlockBase(mod->data_blockid[mod->n_data], &block_base);
+                prog_data = (void *)((uintptr_t)block_base + page_delta);
+                mod->data_base[mod->n_data] = load_addr + original_vaddr;
                 mod->data_size[mod->n_data] = mod->phdr[i].p_memsz;
                 mod->n_data++;
             }
 
-            char *zero = malloc(prog_size - mod->phdr[i].p_filesz);
-            memset(zero, 0, prog_size - mod->phdr[i].p_filesz);
-            kuKernelCpuUnrestrictedMemcpy(prog_data + mod->phdr[i].p_filesz, zero, prog_size - mod->phdr[i].p_filesz);
-            free(zero);
+            mod->phdr[i].p_vaddr = load_addr + original_vaddr;
+            size_t image_end = original_vaddr + mod->phdr[i].p_memsz;
+            if (image_end > mod->text_size)
+                mod->text_size = image_end;
 
+            void *zero = calloc(1, prog_size);
+            if (!zero) {
+                res = -1;
+                goto err_free_data;
+            }
+            kuKernelCpuUnrestrictedMemcpy(block_base, zero, prog_size);
+            free(zero);
             kuKernelCpuUnrestrictedMemcpy((void *)mod->phdr[i].p_vaddr, (void *)((uintptr_t)so_data + mod->phdr[i].p_offset), mod->phdr[i].p_filesz);
         }
+    }
+
+    if (!mod->exec_base) {
+        res = -1;
+        goto err_free_data;
     }
 
     /*
@@ -287,7 +296,10 @@ int _so_load(so_module *mod, SceUID so_blockid, void *so_data, uintptr_t load_ad
     for (int i = 0; i < mod->n_data; i++)
         sceKernelFreeMemBlock(mod->data_blockid[i]);
     err_free_text:
-    sceKernelFreeMemBlock(mod->text_blockid);
+    if (mod->text_blockid > 0)
+        sceKernelFreeMemBlock(mod->text_blockid);
+    if (mod->patch_blockid > 0)
+        sceKernelFreeMemBlock(mod->patch_blockid);
     err_free_so:
     sceKernelFreeMemBlock(so_blockid);
 
