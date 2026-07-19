@@ -54,7 +54,7 @@ If this port or the related Vita work is useful to you, you can
 
 - [`kubridge.skprx`](https://github.com/bythos14/kubridge).
 - `libshacccg.suprx`, normally installed with
-  [ShaRKBR33D]([https://github.com/Rinnegatamante/ShaRKBR33D]).
+  [`ShaRKBR33D`](https://github.com/Rinnegatamante/ShaRKBR33D).
 
 
 Each installed game version must retain its owned source APK under the exact
