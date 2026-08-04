@@ -24,15 +24,12 @@ typedef enum UiContext {
 /* Reset all cached native pointers. Call after libnative.so is initialized. */
 void ui_context_init(void);
 
-/*
- * Check active-screen identity. Returns true only when the deepest active
- * screen changed. controls.c uses this as a touch epoch boundary so an old
- * DOWN cannot confirm a new screen.
- */
 bool ui_context_update(void);
 
 UiContext ui_context_current(void);
 const char *ui_context_name(UiContext context);
+
+bool ui_context_touch_cancel_required(void);
 
 #ifdef __cplusplus
 }
