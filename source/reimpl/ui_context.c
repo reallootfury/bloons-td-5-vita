@@ -72,6 +72,7 @@ typedef struct UiContextState {
     uint32_t epoch;
     UiContext context;
     char screen_name[48];
+    bool touch_cancel_required;
 } UiContextState;
 
 static UiContextState ui_context;
@@ -583,6 +584,25 @@ static UiContext classify_path(const UiResolvedScreen *resolved) {
     }
     return generic;
 }
+
+static bool placement_touch_continues(UiContext old_context,
+                                      const char *old_name,
+                                      UiContext new_context,
+                                      const char *new_name) {
+    if (old_context != UI_CONTEXT_GAME || new_context != UI_CONTEXT_GAME) {
+        return false;
+    }
+
+    bool old_borders = contains_fold(old_name, "InGameBorders");
+    bool new_borders = contains_fold(new_name, "InGameBorders");
+    bool old_placement = contains_fold(old_name, "TowerPlacementScreen");
+    bool new_placement = contains_fold(new_name, "TowerPlacementScreen");
+
+
+    return (old_borders && new_placement) ||
+           (old_placement && new_borders);
+}
+
 void ui_context_init(void) {
     sceClibMemset(&ui_context, 0, sizeof(ui_context));
     resolve_failure_stages = 0;
@@ -590,17 +610,24 @@ void ui_context_init(void) {
 
 bool ui_context_update(void) {
     UiResolvedScreen resolved;
+    char next_screen_name[48] = {0};
     if (!resolve_active_screen(&resolved) ||
         resolved.deepest == ui_context.active_screen) {
         return false;
     }
 
-    ui_context.context = classify_path(&resolved);
+    UiContext next_context = classify_path(&resolved);
+    (void)screen_name(resolved.deepest, next_screen_name,
+                      sizeof(next_screen_name));
+
+    ui_context.touch_cancel_required = !placement_touch_continues(
+        ui_context.context, ui_context.screen_name,
+        next_context, next_screen_name);
+    ui_context.context = next_context;
     ui_context.active_screen = resolved.deepest;
     ++ui_context.epoch;
-    ui_context.screen_name[0] = '\0';
-    (void)screen_name(resolved.deepest, ui_context.screen_name,
-                      sizeof(ui_context.screen_name));
+    sceClibMemcpy(ui_context.screen_name, next_screen_name,
+                  sizeof(ui_context.screen_name));
 
     l_info("Vita UI context: screen=%s (%s), epoch=%u.",
            ui_context.screen_name[0] ? ui_context.screen_name : "<unnamed>",
@@ -610,6 +637,10 @@ bool ui_context_update(void) {
 
 UiContext ui_context_current(void) {
     return ui_context.context;
+}
+
+bool ui_context_touch_cancel_required(void) {
+    return ui_context.touch_cancel_required;
 }
 
 const char *ui_context_name(UiContext context) {
