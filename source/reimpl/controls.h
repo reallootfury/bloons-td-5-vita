@@ -40,6 +40,7 @@ enum {
 };
 
 void controls_init();
+void controls_start_touch_sampler(void);
 void controls_poll();
 void controls_draw_cursor(void);
 
