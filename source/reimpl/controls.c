@@ -8,13 +8,17 @@
 #include "reimpl/controls.h"
 #include "reimpl/ui_context.h"
 #include "utils/logger.h"
+#include "utils/glutil.h"
 #include "utils/settings.h"
 
 #include <math.h>
 #include <stdbool.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <vitaGL.h>
 #include <psp2/ctrl.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/threadmgr.h>
 #include <psp2/motion.h>
 #include <psp2/touch.h>
 #include <psp2/kernel/clib.h>
@@ -25,8 +29,16 @@
 #define LOW_GRAPHICS_TILE_Y   360.0f
 #define LOW_GRAPHICS_TILE_W   250.0f
 #define LOW_GRAPHICS_TILE_H   165.0f
+#define TOUCH_SAMPLE_QUEUE_CAPACITY 256U
+#define TOUCH_SAMPLER_THREAD_STACK  (64U * 1024U)
+#define TOUCH_BATCH_PHASE_LIMIT            2U
+#define TOUCH_PICKUP_RETRY_FRAMES          2U
+#define TOUCH_QUICK_DRAG_RETRY_FRAMES      8U
+#define TOUCH_QUICK_DRAG_RETRY_US          UINT64_C(500000)
+#define TOUCH_GAME_SOURCE_STRIP_FRACTION   0.80f
 
 static void reset_cursor_for_surface(void);
+static void hide_cursor_for_front_touch(void);
 
 void coord_normalize(float * x, float * y, float deadzone) {
     float magnitude = sqrtf((*x * *x) + (*y * *y));
@@ -100,28 +112,358 @@ SceTouchData touch;
 SceTouchData touch_old;
 static unsigned char cancelled_touch_ids[256];
 
+#define TOUCH_DRAG_CANCEL_DISTANCE 14.0f
+
+typedef struct TouchQueuedSample {
+    SceTouchData data;
+    bool coalescible;
+} TouchQueuedSample;
+
+typedef struct TouchGestureState {
+    bool active;
+    bool started_in_borders;
+    bool started_in_game_source_strip;
+    bool placement_seen;
+    bool moved;
+    float start_x;
+    float start_y;
+} TouchGestureState;
+
+enum TouchProcessFlags {
+    TOUCH_PROCESS_NONE = 0,
+    TOUCH_PROCESS_DOWN = 1U << 0,
+    TOUCH_PROCESS_MOVE = 1U << 1,
+    TOUCH_PROCESS_UP = 1U << 2,
+};
+
+static TouchQueuedSample touch_sample_queue[TOUCH_SAMPLE_QUEUE_CAPACITY];
+static size_t touch_sample_read_index = 0;
+static size_t touch_sample_write_index = 0;
+static size_t touch_sample_count = 0;
+static pthread_mutex_t touch_sample_mutex = PTHREAD_MUTEX_INITIALIZER;
+static atomic_bool touch_sampler_started = ATOMIC_VAR_INIT(false);
+static atomic_uint touch_sample_overflows = ATOMIC_VAR_INIT(0);
+static atomic_uint touch_samples_coalesced = ATOMIC_VAR_INIT(0);
+static bool front_touch_activity_this_poll = false;
+static TouchGestureState touch_gestures[256];
+static bool deferred_touch_valid = false;
+static SceTouchData deferred_touch;
+static unsigned int deferred_release_wait_frames = 0;
+static uint64_t deferred_release_queued_us = 0;
+static atomic_uint touch_fast_batches = ATOMIC_VAR_INIT(0);
+static atomic_uint touch_release_holds = ATOMIC_VAR_INIT(0);
+static atomic_bool touch_immediate_down[256];
+static atomic_uint touch_immediate_down_count = ATOMIC_VAR_INIT(0);
+
 static unsigned int touch_id_slot(int id) {
     return (unsigned int)id & 0xffU;
 }
 
-void poll_touch() {
-    SceTouchData sampled_touch;
-    if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &sampled_touch, 1) <= 0) {
-        /* Preserve the previous successful sample. Treating a failed read as
-         * zero contacts would emit a false UP and place the dragged tower. */
+static float touch_screen_x(const SceTouchReport *report) {
+    return (float)report->x * (float)settings_render_width() / 1920.0f;
+}
+
+static float touch_screen_y(const SceTouchReport *report) {
+    return (float)report->y * (float)settings_render_height() / 1088.0f;
+}
+
+static bool touch_is_game_source_strip(float x) {
+    return x >= (float)settings_render_width() *
+                TOUCH_GAME_SOURCE_STRIP_FRACTION;
+}
+
+static bool touch_topology_equal(const SceTouchData *left,
+                                 const SceTouchData *right) {
+    if (left->reportNum != right->reportNum) {
+        return false;
+    }
+    for (int i = 0; i < left->reportNum; ++i) {
+        if (left->report[i].id != right->report[i].id) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool touch_reports_equal(const SceTouchData *left,
+                                const SceTouchData *right) {
+    if (!touch_topology_equal(left, right)) {
+        return false;
+    }
+    for (int i = 0; i < left->reportNum; ++i) {
+        if (left->report[i].x != right->report[i].x ||
+            left->report[i].y != right->report[i].y ||
+            left->report[i].force != right->report[i].force) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void touch_sample_push(const SceTouchData *sample, bool coalescible) {
+    pthread_mutex_lock(&touch_sample_mutex);
+
+    if (touch_sample_count != 0) {
+        size_t last_index =
+            (touch_sample_write_index + TOUCH_SAMPLE_QUEUE_CAPACITY - 1U) %
+            TOUCH_SAMPLE_QUEUE_CAPACITY;
+        TouchQueuedSample *last = &touch_sample_queue[last_index];
+
+        if (touch_reports_equal(&last->data, sample)) {
+            pthread_mutex_unlock(&touch_sample_mutex);
+            return;
+        }
+
+        /* A drag path does not need every hardware sample. Preserve the first
+         * DOWN and the final UP, but continuously replace the queued held
+         * sample with the newest coordinates. This prevents a 13 FPS game
+         * thread from replaying seconds of stale movement after the finger is
+         * already elsewhere. */
+        if (coalescible && last->coalescible &&
+            touch_topology_equal(&last->data, sample)) {
+            sceClibMemcpy(&last->data, sample, sizeof(*sample));
+            atomic_fetch_add_explicit(&touch_samples_coalesced, 1,
+                                      memory_order_relaxed);
+            pthread_mutex_unlock(&touch_sample_mutex);
+            return;
+        }
+    }
+
+    if (touch_sample_count == TOUCH_SAMPLE_QUEUE_CAPACITY) {
+        /* This should be unreachable after movement coalescing. Drop the
+         * oldest semantic sample rather than delaying current input by
+         * several seconds, and expose the event in loader.log. */
+        touch_sample_read_index =
+            (touch_sample_read_index + 1U) % TOUCH_SAMPLE_QUEUE_CAPACITY;
+        touch_sample_count--;
+        atomic_fetch_add_explicit(&touch_sample_overflows, 1,
+                                  memory_order_relaxed);
+    }
+
+    TouchQueuedSample *queued =
+        &touch_sample_queue[touch_sample_write_index];
+    sceClibMemcpy(&queued->data, sample, sizeof(*sample));
+    queued->coalescible = coalescible;
+    touch_sample_write_index =
+        (touch_sample_write_index + 1U) % TOUCH_SAMPLE_QUEUE_CAPACITY;
+    touch_sample_count++;
+    pthread_mutex_unlock(&touch_sample_mutex);
+}
+
+static bool touch_sample_pop(SceTouchData *sample) {
+    bool available = false;
+    pthread_mutex_lock(&touch_sample_mutex);
+    if (touch_sample_count != 0) {
+        sceClibMemcpy(sample,
+                      &touch_sample_queue[touch_sample_read_index].data,
+                      sizeof(*sample));
+        touch_sample_read_index =
+            (touch_sample_read_index + 1U) % TOUCH_SAMPLE_QUEUE_CAPACITY;
+        touch_sample_count--;
+        available = true;
+    }
+    pthread_mutex_unlock(&touch_sample_mutex);
+    return available;
+}
+
+static void touch_sample_drop_pending(void) {
+    pthread_mutex_lock(&touch_sample_mutex);
+    touch_sample_read_index = 0;
+    touch_sample_write_index = 0;
+    touch_sample_count = 0;
+    pthread_mutex_unlock(&touch_sample_mutex);
+    deferred_touch_valid = false;
+    deferred_release_wait_frames = 0;
+    deferred_release_queued_us = 0;
+    for (unsigned int i = 0; i < 256U; ++i) {
+        atomic_store_explicit(&touch_immediate_down[i], false,
+                              memory_order_relaxed);
+    }
+}
+
+static bool touch_sample_contains_id(const SceTouchData *sample, int id) {
+    for (int i = 0; i < sample->reportNum; ++i) {
+        if (sample->report[i].id == id) return true;
+    }
+    return false;
+}
+
+static void touch_dispatch_immediate_game_down(const SceTouchData *previous,
+                                               bool have_previous,
+                                               const SceTouchData *sample) {
+    /* A quick spike/tower gesture can begin and end during one 50-80 ms late
+     * frame. Deliver only the initial DOWN from the blocking sampler thread,
+     * matching Android's separate UI/input thread. MOVE and UP stay in the
+     * semantic queue so their ordering and placement-screen safety remain on
+     * the game frame thread. Restrict this to the live game border screen. */
+    if (!ui_context_is_ingame_borders()) return;
+
+    for (int i = 0; i < sample->reportNum; ++i) {
+        const SceTouchReport *report = &sample->report[i];
+        if (have_previous && touch_sample_contains_id(previous, report->id)) {
+            continue;
+        }
+        unsigned int slot = touch_id_slot(report->id);
+        float x = touch_screen_x(report);
+        float y = touch_screen_y(report);
+        atomic_store_explicit(&touch_immediate_down[slot], true,
+                              memory_order_release);
+        controls_handler_touch(report->id, x, y, CONTROLS_ACTION_DOWN);
+        atomic_fetch_add_explicit(&touch_immediate_down_count, 1,
+                                  memory_order_relaxed);
+    }
+}
+
+static void *touch_sampler_main(void *unused) {
+    (void)unused;
+    SceTouchData previous = {0};
+    bool have_previous = false;
+
+    for (;;) {
+        SceTouchData sample;
+        int result = sceTouchRead(SCE_TOUCH_PORT_FRONT, &sample, 1);
+        if (result > 0) {
+            bool topology_changed = !have_previous ||
+                !touch_topology_equal(&previous, &sample);
+            if (!have_previous || !touch_reports_equal(&previous, &sample)) {
+                touch_dispatch_immediate_game_down(&previous, have_previous,
+                                                   &sample);
+                touch_sample_push(&sample, !topology_changed);
+                sceClibMemcpy(&previous, &sample, sizeof(previous));
+                have_previous = true;
+            }
+        } else {
+            sceKernelDelayThread(1000);
+        }
+    }
+    return NULL;
+}
+
+void controls_start_touch_sampler(void) {
+    if (atomic_load_explicit(&touch_sampler_started, memory_order_acquire)) {
         return;
     }
-    sceClibMemcpy(&touch, &sampled_touch, sizeof(touch));
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    int stack_result = pthread_attr_setstacksize(
+        &attr, TOUCH_SAMPLER_THREAD_STACK);
+    if (stack_result != 0) {
+        l_warn("Could not set touch sampler stack to %u KiB (pthread %d); "
+               "using the default.", TOUCH_SAMPLER_THREAD_STACK / 1024U,
+               stack_result);
+    }
+
+    pthread_t thread;
+    int result = pthread_create(&thread, &attr, touch_sampler_main, NULL);
+    pthread_attr_destroy(&attr);
+    if (result != 0) {
+        l_warn("Could not start blocking touch sampler (pthread %d); "
+               "falling back to once-per-frame touch polling.", result);
+        return;
+    }
+
+    pthread_detach(thread);
+    atomic_store_explicit(&touch_sampler_started, true, memory_order_release);
+    l_info("Immediate in-game touch pickup enabled: the blocking sampler "
+           "delivers DOWN before a stalled nativeTick; newest MOVE remains "
+           "coalesced and UP is frame-ordered with %u map retries or "
+           "%u/%u ms source-strip retries.",
+           TOUCH_PICKUP_RETRY_FRAMES, TOUCH_QUICK_DRAG_RETRY_FRAMES,
+           (unsigned int)(TOUCH_QUICK_DRAG_RETRY_US / 1000U));
+}
+
+static unsigned int touch_transition_flags(const SceTouchData *sampled_touch) {
+    unsigned int flags = TOUCH_PROCESS_NONE;
+
+    for (int i = 0; i < sampled_touch->reportNum; ++i) {
+        int old_index = -1;
+        for (int j = 0; j < touch_old.reportNum; ++j) {
+            if (sampled_touch->report[i].id == touch_old.report[j].id) {
+                old_index = j;
+                break;
+            }
+        }
+        if (old_index < 0) {
+            flags |= TOUCH_PROCESS_DOWN;
+        } else if (sampled_touch->report[i].x != touch_old.report[old_index].x ||
+                   sampled_touch->report[i].y != touch_old.report[old_index].y) {
+            flags |= TOUCH_PROCESS_MOVE;
+        }
+    }
+
+    for (int i = 0; i < touch_old.reportNum; ++i) {
+        bool still_present = false;
+        for (int j = 0; j < sampled_touch->reportNum; ++j) {
+            if (touch_old.report[i].id == sampled_touch->report[j].id) {
+                still_present = true;
+                break;
+            }
+        }
+        if (!still_present) {
+            flags |= TOUCH_PROCESS_UP;
+        }
+    }
+
+    return flags;
+}
+
+static bool touch_has_unclaimed_game_drag(bool *has_source_strip_drag) {
+    if (has_source_strip_drag) {
+        *has_source_strip_drag = false;
+    }
+    if (!ui_context_is_ingame_borders()) {
+        return false;
+    }
+
+    bool found = false;
+    for (int i = 0; i < touch_old.reportNum; ++i) {
+        TouchGestureState *gesture =
+            &touch_gestures[touch_id_slot(touch_old.report[i].id)];
+        gesture->placement_seen |= ui_context_is_tower_placement();
+        if (gesture->active && gesture->started_in_borders &&
+            gesture->moved && !gesture->placement_seen) {
+            found = true;
+            if (has_source_strip_drag &&
+                gesture->started_in_game_source_strip) {
+                *has_source_strip_drag = true;
+            }
+        }
+    }
+    return found;
+}
+
+static void touch_replay_unclaimed_game_drag(void) {
+    /* BTD5 may need another held event before it changes from InGameBorders to
+     * TowerPlacementScreen. A very quick physical DOWN/MOVE/UP can otherwise
+     * finish entirely inside one 50-100 ms nativeTick. Replaying only the
+     * newest MOVE keeps the original pointer identity and does not invent a
+     * second tap. */
+    for (int i = 0; i < touch_old.reportNum; ++i) {
+        const SceTouchReport *report = &touch_old.report[i];
+        TouchGestureState *gesture =
+            &touch_gestures[touch_id_slot(report->id)];
+        if (!gesture->active || !gesture->started_in_borders ||
+            !gesture->moved || gesture->placement_seen) {
+            continue;
+        }
+        controls_handler_touch(report->id, touch_screen_x(report),
+                               touch_screen_y(report),
+                               CONTROLS_ACTION_MOVE);
+    }
+}
+
+static unsigned int process_touch_sample(const SceTouchData *sampled_touch) {
+    unsigned int flags = TOUCH_PROCESS_NONE;
+    front_touch_activity_this_poll |=
+        sampled_touch->reportNum > 0 || touch_old.reportNum > 0;
+    sceClibMemcpy(&touch, sampled_touch, sizeof(touch));
 
     for (int i = 0; i < touch.reportNum; i++) {
-        float x = (float)touch.report[i].x *
-                  (float)settings_render_width() / 1920.0f;
-        float y = (float)touch.report[i].y *
-                  (float)settings_render_height() / 1088.0f;
+        float x = touch_screen_x(&touch.report[i]);
+        float y = touch_screen_y(&touch.report[i]);
 
-        // Check if the finger was down before to distinguish between the Move and Down events
         int old_finger_index = -1;
-
         if (touch_old.reportNum > 0) {
             for (int j = 0; j < touch_old.reportNum; j++) {
                 if (touch.report[i].id == touch_old.report[j].id) {
@@ -132,48 +474,195 @@ void poll_touch() {
         }
 
         unsigned int slot = touch_id_slot(touch.report[i].id);
+        TouchGestureState *gesture = &touch_gestures[slot];
         if (old_finger_index < 0) {
+            gesture->active = true;
+            gesture->started_in_borders = ui_context_is_ingame_borders();
+            gesture->started_in_game_source_strip =
+                gesture->started_in_borders && touch_is_game_source_strip(x);
+            gesture->placement_seen = ui_context_is_tower_placement();
+            gesture->moved = false;
+            gesture->start_x = x;
+            gesture->start_y = y;
+            flags |= TOUCH_PROCESS_DOWN;
+
+            bool down_already_dispatched = atomic_exchange_explicit(
+                &touch_immediate_down[slot], false, memory_order_acq_rel);
             if (low_graphics_tile_hit(x, y)) {
                 cancelled_touch_ids[slot] = 1;
+                if (down_already_dispatched) {
+                    controls_handler_touch(touch.report[i].id, x, y,
+                                           CONTROLS_ACTION_CANCEL);
+                }
                 toggle_low_graphics();
             } else {
                 cancelled_touch_ids[slot] = 0;
-                controls_handler_touch(touch.report[i].id, x, y,
-                                       CONTROLS_ACTION_DOWN);
+                if (!down_already_dispatched) {
+                    controls_handler_touch(touch.report[i].id, x, y,
+                                           CONTROLS_ACTION_DOWN);
+                }
             }
         } else if (!cancelled_touch_ids[slot] &&
-                   (touch.report[i].x != touch_old.report[old_finger_index].x ||
-                    touch.report[i].y != touch_old.report[old_finger_index].y)) {
-            controls_handler_touch(touch.report[i].id, x, y, CONTROLS_ACTION_MOVE);
+                   (touch.report[i].x !=
+                        touch_old.report[old_finger_index].x ||
+                    touch.report[i].y !=
+                        touch_old.report[old_finger_index].y)) {
+            float dx = x - gesture->start_x;
+            float dy = y - gesture->start_y;
+            if (dx * dx + dy * dy >=
+                TOUCH_DRAG_CANCEL_DISTANCE * TOUCH_DRAG_CANCEL_DISTANCE) {
+                gesture->moved = true;
+            }
+            gesture->placement_seen |= ui_context_is_tower_placement();
+            controls_handler_touch(touch.report[i].id, x, y,
+                                   CONTROLS_ACTION_MOVE);
+            flags |= TOUCH_PROCESS_MOVE;
         }
     }
 
     for (int i = 0; i < touch_old.reportNum; i++) {
         int finger_up = 1;
-
         for (int j = 0; j < touch.reportNum; j++) {
-            if (touch.report[j].id == touch_old.report[i].id ) {
+            if (touch.report[j].id == touch_old.report[i].id) {
                 finger_up = 0;
                 break;
             }
         }
 
         if (finger_up == 1) {
-            float x = (float)touch_old.report[i].x *
-                      (float)settings_render_width() / 1920.0f;
-            float y = (float)touch_old.report[i].y *
-                      (float)settings_render_height() / 1088.0f;
-
+            float x = touch_screen_x(&touch_old.report[i]);
+            float y = touch_screen_y(&touch_old.report[i]);
             unsigned int slot = touch_id_slot(touch_old.report[i].id);
+            TouchGestureState *gesture = &touch_gestures[slot];
+
             if (!cancelled_touch_ids[slot]) {
-                controls_handler_touch(touch_old.report[i].id, x, y,
-                                       CONTROLS_ACTION_UP);
+                gesture->placement_seen |= ui_context_is_tower_placement();
+                if (gesture->active && gesture->started_in_borders &&
+                    gesture->moved && !gesture->placement_seen &&
+                    ui_context_is_ingame_borders()) {
+                    if (gesture->started_in_game_source_strip) {
+                        /* The gesture began in BTD5's right-side tower/special
+                         * source strip. Even if a very slow frame hid the brief
+                         * TowerPlacementScreen transition from ui_context, the
+                         * correct semantic end is a placement release, not a
+                         * cancellation. This is the fast pineapple/spike path. */
+                        controls_handler_touch(touch_old.report[i].id, x, y,
+                                               CONTROLS_ACTION_UP);
+                        l_info("Completed rapid source-strip drag at %.1f,%.1f "
+                               "after held-event pickup retries.", x, y);
+                    } else {
+                        /* A map-origin drag was never claimed as placement.
+                         * ACTION_UP can be reinterpreted as a tap and select a
+                         * nearby farm/UI item, so preserve the proven safety
+                         * cancellation for non-source gestures. */
+                        controls_handler_touch(touch_old.report[i].id, x, y,
+                                               CONTROLS_ACTION_CANCEL);
+                        l_warn("Cancelled unclaimed game drag at %.1f,%.1f; "
+                               "prevented release from becoming a farm/UI tap.",
+                               x, y);
+                    }
+                } else {
+                    controls_handler_touch(touch_old.report[i].id, x, y,
+                                           CONTROLS_ACTION_UP);
+                }
             }
             cancelled_touch_ids[slot] = 0;
+            sceClibMemset(gesture, 0, sizeof(*gesture));
+            flags |= TOUCH_PROCESS_UP;
         }
     }
 
     sceClibMemcpy(&touch_old, &touch, sizeof(touch));
+    return flags;
+}
+
+void poll_touch() {
+    front_touch_activity_this_poll = false;
+
+    if (atomic_load_explicit(&touch_sampler_started, memory_order_acquire)) {
+        /* A release captured during a low-FPS frame is never delivered in the
+         * same nativeTick as its DOWN/MOVE. Map-origin drags retain the proven
+         * two-pass cancellation safety. Drags beginning in BTD5's right-side
+         * tower/special strip replay the newest held MOVE for up to eight passes
+         * (bounded to 500 ms), giving the closed-source input state time to enter
+         * TowerPlacementScreen before the physical UP is delivered. */
+        if (deferred_touch_valid) {
+            bool has_source_strip_drag = false;
+            bool unclaimed = touch_has_unclaimed_game_drag(
+                &has_source_strip_drag);
+            if (unclaimed) {
+                uint64_t now_us = sceKernelGetProcessTimeWide();
+                unsigned int retry_limit = has_source_strip_drag ?
+                    TOUCH_QUICK_DRAG_RETRY_FRAMES :
+                    TOUCH_PICKUP_RETRY_FRAMES;
+                bool within_time_limit = !has_source_strip_drag ||
+                    deferred_release_queued_us == 0 ||
+                    now_us - deferred_release_queued_us <
+                        TOUCH_QUICK_DRAG_RETRY_US;
+                if (deferred_release_wait_frames < retry_limit &&
+                    within_time_limit) {
+                    touch_replay_unclaimed_game_drag();
+                    ++deferred_release_wait_frames;
+                    atomic_fetch_add_explicit(&touch_release_holds, 1,
+                                              memory_order_relaxed);
+                    return;
+                }
+            }
+
+            (void)process_touch_sample(&deferred_touch);
+            deferred_touch_valid = false;
+            deferred_release_wait_frames = 0;
+            deferred_release_queued_us = 0;
+            return;
+        }
+
+        SceTouchData sampled_touch;
+        unsigned int delivered_phases = 0;
+        while (touch_sample_pop(&sampled_touch)) {
+            unsigned int transition = touch_transition_flags(&sampled_touch);
+
+            /* Preserve the release for the next game update.  DOWN followed
+             * by the newest MOVE may be batched into this frame, which removes
+             * the previous two-frame pickup latency at 10-15 FPS. */
+            if (transition & TOUCH_PROCESS_UP) {
+                sceClibMemcpy(&deferred_touch, &sampled_touch,
+                              sizeof(deferred_touch));
+                deferred_touch_valid = true;
+                deferred_release_wait_frames = 0;
+                deferred_release_queued_us = sceKernelGetProcessTimeWide();
+                break;
+            }
+
+            unsigned int processed = process_touch_sample(&sampled_touch);
+            if (processed != TOUCH_PROCESS_NONE) {
+                ++delivered_phases;
+                if (delivered_phases >= TOUCH_BATCH_PHASE_LIMIT) {
+                    atomic_fetch_add_explicit(&touch_fast_batches, 1,
+                                              memory_order_relaxed);
+                    break;
+                }
+            }
+        }
+
+        static unsigned int logged_overflows = 0;
+        unsigned int overflows = atomic_load_explicit(
+            &touch_sample_overflows, memory_order_relaxed);
+        if (overflows != logged_overflows) {
+            l_warn("Semantic touch queue overflowed %u times; this now means "
+                   "more than %u distinct touch transitions accumulated.",
+                   overflows, TOUCH_SAMPLE_QUEUE_CAPACITY);
+            logged_overflows = overflows;
+        }
+        return;
+    }
+
+    SceTouchData sampled_touch;
+    if (sceTouchPeek(SCE_TOUCH_PORT_FRONT, &sampled_touch, 1) <= 0) {
+        /* Preserve the previous successful sample. Treating a failed read as
+         * zero contacts would emit a false UP and place the dragged tower. */
+        return;
+    }
+    (void)process_touch_sample(&sampled_touch);
 }
 
 uint32_t old_buttons = 0, current_buttons = 0, pressed_buttons = 0, released_buttons = 0;
@@ -194,6 +683,15 @@ static uint64_t cursor_last_activity_us = 0;
 static uint64_t low_graphics_notice_until_us = 0;
 static uint64_t start_pressed_at_us = 0;
 static bool start_exit_triggered = false;
+
+static void hide_cursor_for_front_touch(void) {
+    /* Direct touch users do not need the loader cursor. Hiding it immediately
+     * also removes the final scissor/clear overlay and the resulting full GL
+     * state-cache invalidation from touch-heavy gameplay frames. Any later
+     * stick movement calls mark_cursor_activity() and shows it again. */
+    cursor_visible = false;
+    cursor_last_activity_us = 0;
+}
 
 #define VIRTUAL_CURSOR_TOUCH_ID 0x7fff
 #define CURSOR_ANALOG_SPEED 12.0f
@@ -269,9 +767,10 @@ static bool cancel_active_touches(void) {
  * while a pad gesture is held, cancel only the synthetic contact and leave
  * the newly sampled physical contact active. */
 static void cancel_synthetic_touches_for_front_touch(void) {
-    if (touch.reportNum <= 0) {
+    if (!front_touch_activity_this_poll && touch.reportNum <= 0) {
         return;
     }
+    hide_cursor_for_front_touch();
     if (cursor_down) {
         controls_handler_touch(VIRTUAL_CURSOR_TOUCH_ID, cursor_x, cursor_y,
                                CONTROLS_ACTION_CANCEL);
@@ -280,11 +779,29 @@ static void cancel_synthetic_touches_for_front_touch(void) {
     }
 }
 
-/* A native screen change is a touch epoch boundary. Cancel at the OLD
- * coordinates. Held buttons remain suppressed until released so they cannot
- * immediately start a second contact on the newly opened popup. */
+/* Most native screen changes are touch epoch boundaries. Tower selection is
+ * different: BTD5 changes InGameBorders to TowerPlacementScreen in response
+ * to the original DOWN, then expects MOVE/UP from that same pointer. Cancelling
+ * there makes the tower tray blink and aborts every monkey/spike/pineapple
+ * placement. ui_context.c identifies only that proven continuation pair. */
 static void handle_ui_screen_change(void) {
+    if (!ui_context_touch_cancel_required()) {
+        if (ui_context_is_tower_placement()) {
+            for (int i = 0; i < touch.reportNum; ++i) {
+                touch_gestures[touch_id_slot(touch.report[i].id)].placement_seen = true;
+            }
+        }
+        if (touch.reportNum > 0 || cursor_down) {
+            l_info("Preserving active touch across BTD5 placement screen transition.");
+        }
+        return;
+    }
+
     (void)cancel_active_touches();
+    /* Events sampled for the previous screen must not be replayed into the
+     * newly opened menu or popup. A currently held finger remains suppressed
+     * until its physical UP arrives. */
+    touch_sample_drop_pending();
     if (current_buttons & CURSOR_TOUCH_BUTTONS) {
         cursor_buttons_suppressed = true;
     }
@@ -626,6 +1143,10 @@ void controls_draw_cursor(void) {
     glDisable(GL_SCISSOR_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    /* The overlay calls vitaGL directly, outside the game's import wrappers.
+     * Forget cached game state so the next frame cannot skip a restoration
+     * that the overlay changed underneath it. */
+    gl_state_cache_invalidate();
 }
 
 void poll_stick(ControlsStickId which, float raw_x, float raw_y, float * readings_x, float * readings_y, float deadzone) {
