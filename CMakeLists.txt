@@ -6,7 +6,7 @@ endif ()
 
 set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "Toolchain file")
 
-project(btd5_vita C CXX)
+project(btd5_vita C CXX ASM)
 
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
@@ -52,6 +52,32 @@ set(DATA_PATH "ux0:data/btd5/" CACHE STRING "Path to user-supplied game data (wi
 set(SO_PATH "${DATA_PATH}libnative.so" CACHE STRING "Path to the Android ARMv7 executable")
 add_definitions(-DDATA_PATH="${DATA_PATH}" -DSO_PATH="${SO_PATH}")
 
+option(BTD5_NATIVE_PHASE_PROFILER
+       "Compile the BTD5 4.7 native phase profiler; it installs only when loader logging is enabled" ON)
+option(BTD5_FRAME_DEBT_CLAMP
+       "Cap severe BTD5 4.7 frame debt at 33.33 ms before the active update" ON)
+option(BTD5_RELEASE_TELEMETRY
+       "Compile periodic telemetry; runtime collection occurs only in the logging VPK" ON)
+if (BTD5_RELEASE_TELEMETRY)
+  add_definitions(-DBTD5_RELEASE_TELEMETRY)
+endif()
+if (BTD5_RELEASE_TELEMETRY OR BTD5_NATIVE_PHASE_PROFILER)
+  add_definitions(-DBTD5_PERIODIC_TELEMETRY)
+endif()
+if (BTD5_NATIVE_PHASE_PROFILER)
+  add_definitions(-DBTD5_NATIVE_PHASE_PROFILER)
+endif()
+if (BTD5_FRAME_DEBT_CLAMP)
+  add_definitions(-DBTD5_FRAME_DEBT_CLAMP)
+endif()
+if (BTD5_NATIVE_PHASE_PROFILER OR BTD5_FRAME_DEBT_CLAMP)
+  set(BTD5_NATIVE_PATCH_SOURCES source/engine_callsite.S)
+  set_source_files_properties(source/engine_callsite.S PROPERTIES
+    COMPILE_FLAGS "-mcpu=cortex-a9 -mthumb")
+else()
+  set(BTD5_NATIVE_PATCH_SOURCES)
+endif()
+
 option(USE_SCELIBC_IO "Use SceLibcBridge for IO and some other std functions" ON)
 if (USE_SCELIBC_IO)
   add_definitions(-DUSE_SCELIBC_IO)
@@ -94,18 +120,23 @@ endif()
 add_definitions(-D_GNU_SOURCE -D__POSIX_VISIBLE=999999)
 add_definitions(-DBTD5_RUNTIME_LOGGING)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q -mfloat-abi=softfp -std=gnu11 -Wno-deprecated")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wl,-q -mfloat-abi=softfp -std=gnu++20 -Wno-write-strings -Wno-psabi")
+# The loader and compatibility shims execute on Vita's Cortex-A9/NEON CPU.
+# Keep Android's soft-float call ABI while allowing local bridge/audio/input
+# code to use the actual processor and omit frame pointers in Release builds.
+set(BTD5_CPU_FLAGS "-mcpu=cortex-a9 -mtune=cortex-a9 -mfpu=neon -mfloat-abi=softfp")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wl,-q ${BTD5_CPU_FLAGS} -std=gnu11 -Wno-deprecated")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wl,-q ${BTD5_CPU_FLAGS} -std=gnu++20 -Wno-write-strings -Wno-psabi")
 
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O1 -g3")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O1 -g3")
 else ()
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -g0 -ffast-math")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -g0 -ffast-math")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -g0 -ffast-math -fomit-frame-pointer")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -g0 -ffast-math -fomit-frame-pointer")
 endif()
 
 add_executable(${CMAKE_PROJECT_NAME}
+               ${BTD5_NATIVE_PATCH_SOURCES}
                source/diagnostics.c
                source/game.c
                source/music.c
@@ -113,6 +144,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/dynlib.c
                source/java.c
                source/patch.c
+               source/patch.h
                source/reimpl/bits/_ctype.c
                source/reimpl/bionic.c
                source/reimpl/controls.c

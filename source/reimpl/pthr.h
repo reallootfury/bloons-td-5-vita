@@ -43,6 +43,7 @@ typedef struct {
 
 int pthr_bridge_init(void);
 void pthr_diag_log_threads(void);
+void pthr_set_android_worker_cpu_mask(int mask);
 
 // pthread_t is same size on bionic and newlib
 int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr, void *(*start)(void *), void *param);

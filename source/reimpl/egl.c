@@ -21,6 +21,7 @@
 
 static atomic_bool first_swap_reported = ATOMIC_VAR_INIT(false);
 static atomic_uint_fast64_t swap_count = ATOMIC_VAR_INIT(0);
+static bool egl_diagnostics_enabled = false;
 /* eglSwapBuffers is called by BTD5's main render thread. These interval
  * counters therefore need no lock and are reset by that same thread. */
 static EGLTimingStats swap_timing;
@@ -299,6 +300,7 @@ EGLSurface eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config,
 
 EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
                           EGLContext ctx) {
+    gl_state_cache_invalidate();
     return EGL_TRUE;
 }
 
@@ -316,23 +318,40 @@ EGLBoolean eglTerminate(EGLDisplay dpy) {
     return EGL_TRUE;
 }
 
+void egl_set_diagnostics_enabled(int enabled) {
+    egl_diagnostics_enabled = enabled != 0;
+}
+
 EGLBoolean eglSwapBuffers_soloader(EGLDisplay display, EGLSurface surface) {
-    uint64_t timing_started_us = sceKernelGetProcessTimeWide();
-    btd5_diag_set_stage(BTD5_STAGE_EGL_SWAP);
+#ifdef BTD5_PERIODIC_TELEMETRY
+    uint64_t timing_started_us = egl_diagnostics_enabled ?
+        sceKernelGetProcessTimeWide() : 0;
+#endif
+    if (egl_diagnostics_enabled) {
+        btd5_diag_set_stage(BTD5_STAGE_EGL_SWAP);
+    }
     controls_draw_cursor();
     EGLBoolean result = eglSwapBuffers(display, surface);
-    btd5_diag_set_stage(BTD5_STAGE_EGL_SWAP_RETURNED);
-    uint64_t elapsed_us = sceKernelGetProcessTimeWide() - timing_started_us;
-    swap_timing.samples++;
-    swap_timing.total_us += elapsed_us;
-    if (elapsed_us > swap_timing.max_us) {
-        swap_timing.max_us = elapsed_us;
+    if (egl_diagnostics_enabled) {
+        btd5_diag_set_stage(BTD5_STAGE_EGL_SWAP_RETURNED);
     }
-    atomic_fetch_add_explicit(&swap_count, 1, memory_order_relaxed);
-    if (!atomic_exchange_explicit(&first_swap_reported, true,
-                                  memory_order_relaxed)) {
-        l_success("First EGL buffer swap reached (result %d).", result);
-        log_flush();
+#ifdef BTD5_PERIODIC_TELEMETRY
+    if (egl_diagnostics_enabled) {
+        uint64_t elapsed_us = sceKernelGetProcessTimeWide() - timing_started_us;
+        swap_timing.samples++;
+        swap_timing.total_us += elapsed_us;
+        if (elapsed_us > swap_timing.max_us) {
+            swap_timing.max_us = elapsed_us;
+        }
+    }
+#endif
+    if (egl_diagnostics_enabled) {
+        atomic_fetch_add_explicit(&swap_count, 1, memory_order_relaxed);
+        if (!atomic_exchange_explicit(&first_swap_reported, true,
+                                      memory_order_relaxed)) {
+            l_success("First EGL buffer swap reached (result %d).", result);
+            log_flush();
+        }
     }
     return result;
 }

@@ -92,6 +92,8 @@ int fclose_soloader(FILE *f);
  * transactions without forcing Android lifecycle calls. */
 uint32_t profile_save_generation(void);
 
+uint64_t profile_save_last_closed_us(void);
+
 int closedir_soloader(DIR *dir);
 
 int fcntl_soloader(int fd, int cmd, ...);

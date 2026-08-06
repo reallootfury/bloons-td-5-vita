@@ -55,6 +55,7 @@ EGLBoolean eglTerminate(EGLDisplay dpy);
 
 EGLBoolean eglSwapBuffers_soloader(EGLDisplay display, EGLSurface surface);
 
+void egl_set_diagnostics_enabled(int enabled);
 uint64_t egl_swap_count(void);
 
 typedef struct EGLTimingStats {

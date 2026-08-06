@@ -17,6 +17,7 @@
 #include <psp2/kernel/processmgr.h>
 #include <psp2/rtc.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <so_util/so_util.h>
 
 #include "utils/utils.h"
@@ -174,4 +175,35 @@ int setenv_soloader(const char * name, const char * value, int overwrite) {
 
 int getpagesize(void) {
     return PAGE_SIZE;
+}
+
+/* Android/Bionic sysconf values used by libc++ and Boost in BTD5 4.7.
+ * The game calls _SC_NPROCESSORS_ONLN (0x61) from both
+ * std::thread::hardware_concurrency() and boost::thread::hardware_concurrency().
+ * Returning zero, as the old generic stub did, advertises no usable CPU and
+ * can suppress or undersize the game's own worker pools. */
+#define BIONIC_SC_PAGESIZE             39
+#define BIONIC_SC_NPROCESSORS_CONF     96
+#define BIONIC_SC_NPROCESSORS_ONLN     97
+#define BTD5_VITA_USER_CPU_COUNT        3
+
+long sysconf_soloader(int name) {
+    static atomic_bool cpu_count_logged = ATOMIC_VAR_INIT(false);
+
+    switch (name) {
+    case BIONIC_SC_PAGESIZE:
+        return PAGE_SIZE;
+    case BIONIC_SC_NPROCESSORS_CONF:
+    case BIONIC_SC_NPROCESSORS_ONLN:
+        if (!atomic_exchange_explicit(&cpu_count_logged, true,
+                                      memory_order_relaxed)) {
+            l_info("Android sysconf: reporting %d online Vita user CPUs.",
+                   BTD5_VITA_USER_CPU_COUNT);
+        }
+        return BTD5_VITA_USER_CPU_COUNT;
+    default:
+        /* Preserve the old stub's neutral result for unimplemented queries.
+         * BTD5 only needs the processor and page-size values above. */
+        return 0;
+    }
 }

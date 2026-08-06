@@ -5,10 +5,12 @@
 #include "utils/glutil.h"
 #include "utils/utils.h"
 #include "diagnostics.h"
+#include "patch.h"
 #include "game.h"
 #include "java.h"
 
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/cpu.h>
 #include <psp2/kernel/processmgr.h>
 #include <psp2/appmgr.h>
 #include <psp2/io/fcntl.h>
@@ -109,6 +111,7 @@ static BTD5NativeBool native_lost_audio_focus;
 static BTD5NativeVoid native_gained_audio_focus;
 static BTD5NativeOrientation native_orientation_changed;
 static BTD5NativeLicenseResult native_license_result;
+static pthread_mutex_t native_touch_dispatch_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static atomic_bool native_tick_active = ATOMIC_VAR_INIT(false);
 static atomic_uint_fast64_t native_tick_started_us = ATOMIC_VAR_INIT(0);
@@ -118,35 +121,166 @@ static atomic_int main_thread_id = ATOMIC_VAR_INIT(-1);
 static atomic_bool native_surface_active = ATOMIC_VAR_INIT(false);
 static atomic_uint_fast64_t native_surface_started_us = ATOMIC_VAR_INIT(0);
 static atomic_bool clean_exit_requested = ATOMIC_VAR_INIT(false);
-static uint32_t committed_profile_generation = 0;
+static bool runtime_diagnostics_enabled = false;
+
+#define PROFILE_SYNC_QUIET_US        UINT64_C(3000000)
+#define PROFILE_SYNC_MIN_INTERVAL_US UINT64_C(15000000)
+#define PROFILE_SYNC_MAX_DIRTY_US    UINT64_C(30000000)
+#define PROFILE_SYNC_POLL_US         (250 * 1000)
+#define PROFILE_SYNC_THREAD_STACK    (96 * 1024)
+
+static atomic_uint committed_profile_generation = ATOMIC_VAR_INIT(0);
+static pthread_mutex_t profile_sync_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t profile_sync_retry_after_us = 0;
+static uint64_t profile_last_sync_us = 0;
+static bool profile_sync_worker_available = false;
 
-static void sync_profile_storage(bool force, const char *reason) {
-    uint32_t pending = profile_save_generation();
-    if (!force && pending == committed_profile_generation) {
-        return;
-    }
-
-    uint64_t now = sceKernelGetProcessTimeWide();
-    if (!force && now < profile_sync_retry_after_us) {
-        return;
-    }
-
-    int result = sceIoSync("ux0:", 0);
+static void configure_main_thread_affinity(void) {
+    /* The previous fix hard-pinned nativeTick to core 0 and pushed every
+     * Android worker onto cores 1/2/3. The supplied late-game run regressed
+     * under that layout. Let the Vita scheduler balance the main thread and
+     * game workers across the three supported user cores instead. CPU3 is
+     * intentionally not selected: it is system-reserved and the captured run
+     * already showed worse contention when CapUnlocker exposed it. */
+    int result = sceKernelChangeThreadCpuAffinityMask(
+        sceKernelGetThreadId(), SCE_KERNEL_CPU_MASK_USER_ALL);
     if (result < 0) {
-        l_warn("Could not commit BTD5 profile storage (%s): 0x%08x.",
-               reason, (unsigned int)result);
-        profile_sync_retry_after_us = now + 1000ULL * 1000ULL;
-        return;
+        l_warn("Could not restore scheduler-balanced main-thread affinity: "
+               "0x%08x.", (unsigned int)result);
+    }
+
+    pthr_set_android_worker_cpu_mask(SCE_KERNEL_CPU_MASK_USER_ALL);
+    l_info("CPU layout: nativeTick/render and Android workers are "
+           "scheduler-balanced across user cores 0/1/2; system CPU3 is "
+           "disabled by default.");
+}
+
+static bool sync_profile_storage(bool force, const char *reason) {
+    uint32_t pending = profile_save_generation();
+    uint32_t committed = atomic_load_explicit(
+        &committed_profile_generation, memory_order_acquire);
+    if (!force && pending == committed) {
+        return true;
+    }
+
+    pthread_mutex_lock(&profile_sync_mutex);
+    pending = profile_save_generation();
+    committed = atomic_load_explicit(&committed_profile_generation,
+                                     memory_order_acquire);
+    uint64_t now = sceKernelGetProcessTimeWide();
+    if (!force && pending == committed) {
+        pthread_mutex_unlock(&profile_sync_mutex);
+        return true;
+    }
+    if (!force && now < profile_sync_retry_after_us) {
+        pthread_mutex_unlock(&profile_sync_mutex);
+        return false;
+    }
+
+    uint64_t started_us = now;
+    int result = sceIoSync("ux0:", 0);
+    uint64_t completed_us = sceKernelGetProcessTimeWide();
+    uint64_t elapsed_us = completed_us - started_us;
+    if (result < 0) {
+        l_warn("Could not commit BTD5 profile storage (%s): 0x%08x "
+               "after %llu.%01llu ms.", reason, (unsigned int)result,
+               (unsigned long long)(elapsed_us / 1000ULL),
+               (unsigned long long)((elapsed_us % 1000ULL) / 100ULL));
+        profile_sync_retry_after_us = completed_us + UINT64_C(1000000);
+        pthread_mutex_unlock(&profile_sync_mutex);
+        return false;
     }
 
     profile_sync_retry_after_us = 0;
-    committed_profile_generation = pending;
+    profile_last_sync_us = completed_us;
+    atomic_store_explicit(&committed_profile_generation, pending,
+                          memory_order_release);
     if (pending != 0) {
-        l_success("Autosave checkpoint %u committed (%s).", pending, reason);
+        l_success("Autosave checkpoint %u committed (%s, %llu.%01llu ms).",
+                  pending, reason,
+                  (unsigned long long)(elapsed_us / 1000ULL),
+                  (unsigned long long)((elapsed_us % 1000ULL) / 100ULL));
     } else {
-        l_info("BTD5 storage committed (%s).", reason);
+        l_info("BTD5 storage committed (%s, %llu.%01llu ms).", reason,
+               (unsigned long long)(elapsed_us / 1000ULL),
+               (unsigned long long)((elapsed_us % 1000ULL) / 100ULL));
     }
+    pthread_mutex_unlock(&profile_sync_mutex);
+    return true;
+}
+
+static void *profile_sync_worker(void *unused) {
+    (void)unused;
+    uint64_t dirty_since_us = 0;
+
+    for (;;) {
+        sceKernelDelayThread(PROFILE_SYNC_POLL_US);
+
+        uint32_t pending = profile_save_generation();
+        uint32_t committed = atomic_load_explicit(
+            &committed_profile_generation, memory_order_acquire);
+        if (pending == committed) {
+            dirty_since_us = 0;
+            continue;
+        }
+
+        uint64_t now = sceKernelGetProcessTimeWide();
+        if (dirty_since_us == 0) {
+            dirty_since_us = now;
+        }
+
+        uint64_t last_closed_us = profile_save_last_closed_us();
+        pthread_mutex_lock(&profile_sync_mutex);
+        uint64_t last_sync_us = profile_last_sync_us;
+        pthread_mutex_unlock(&profile_sync_mutex);
+
+        bool quiet = last_closed_us != 0 &&
+                     now - last_closed_us >= PROFILE_SYNC_QUIET_US;
+        bool interval_elapsed = last_sync_us == 0 ||
+                                now - last_sync_us >=
+                                    PROFILE_SYNC_MIN_INTERVAL_US;
+        bool max_age_reached = now - dirty_since_us >=
+                               PROFILE_SYNC_MAX_DIRTY_US;
+
+        if ((quiet && interval_elapsed) || max_age_reached) {
+            const char *reason = max_age_reached
+                ? "write-back cache maximum age"
+                : "write-back cache quiet period";
+            (void)sync_profile_storage(false, reason);
+            if (profile_save_generation() == atomic_load_explicit(
+                    &committed_profile_generation, memory_order_acquire)) {
+                dirty_since_us = 0;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void start_profile_sync_worker(void) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    int stack_result = pthread_attr_setstacksize(
+        &attr, PROFILE_SYNC_THREAD_STACK);
+    if (stack_result != 0) {
+        l_warn("Could not set profile write-back thread stack to %u KiB "
+               "(pthread %d); using the default.",
+               PROFILE_SYNC_THREAD_STACK / 1024U, stack_result);
+    }
+
+    pthread_t thread;
+    int result = pthread_create(&thread, &attr, profile_sync_worker, NULL);
+    pthread_attr_destroy(&attr);
+    if (result != 0) {
+        l_warn("Could not start profile write-back cache thread (pthread %d); "
+               "falling back to synchronous save commits.", result);
+        return;
+    }
+
+    pthread_detach(thread);
+    profile_sync_worker_available = true;
+    l_info("Profile write-back cache enabled: 3 s quiet period, 15 s "
+           "minimum commit interval, 30 s maximum dirty age; pause and "
+           "clean exit still force a commit.");
 }
 
 static void *tick_watchdog(void *unused) {
@@ -345,6 +479,12 @@ void controls_handler_key(int32_t keycode, ControlsAction action) {
 }
 
 void controls_handler_touch(int32_t id, float x, float y, ControlsAction action) {
+    /* Android delivers MotionEvent callbacks on its UI thread while the game
+     * renderer advances on a separate thread. The Vita touch sampler mirrors
+     * that model for immediate in-game DOWN delivery. Serialize callbacks so
+     * the sampler and frame thread cannot enter the native input bridge at the
+     * same time. */
+    pthread_mutex_lock(&native_touch_dispatch_mutex);
     switch (action) {
     case CONTROLS_ACTION_DOWN:
         native_touch_started(&jni, NULL, x, y, id);
@@ -361,6 +501,7 @@ void controls_handler_touch(int32_t id, float x, float y, ControlsAction action)
         native_touch_cancelled(&jni, NULL, x, y, id);
         break;
     }
+    pthread_mutex_unlock(&native_touch_dispatch_mutex);
 }
 
 void controls_handler_analog(ControlsStickId which, float x, float y, ControlsAction action) {
@@ -403,7 +544,11 @@ static void perform_clean_exit(void) {
 
 int main(void) {
     log_start_session();
+    runtime_diagnostics_enabled = log_is_enabled();
+    btd5_diag_set_enabled(runtime_diagnostics_enabled);
+    egl_set_diagnostics_enabled(runtime_diagnostics_enabled);
     l_success("BTD5 loader 01.00 started.");
+    l_info("Performance v7.2 single-build path: retained the complete v6.9 OpenSLES and stable renderer behavior, enabled fingerprint-gated frame-debt protection, added a conservative vertex-layout state cache, and restricted deep profiling plus periodic timing to the logging VPK. Unstable draw batching, upload-content deduplication, section-GC and LTO remain disabled.");
     log_flush();
 
     soloader_platform_init();
@@ -430,15 +575,18 @@ int main(void) {
     native_load(&jni, NULL, activity, assets);
     l_success("nativeLoad returned.");
 
-    atomic_store_explicit(&main_thread_id, sceKernelGetThreadId(),
-                          memory_order_release);
-    btd5_diag_bind_current_thread();
-    pthread_t watchdog;
-    if (pthread_create(&watchdog, NULL, tick_watchdog, NULL) == 0) {
-        pthread_detach(watchdog);
-    } else {
-        l_warn("Could not start startup/nativeTick watchdog thread.");
+    if (runtime_diagnostics_enabled) {
+        atomic_store_explicit(&main_thread_id, sceKernelGetThreadId(),
+                              memory_order_release);
+        btd5_diag_bind_current_thread();
+        pthread_t watchdog;
+        if (pthread_create(&watchdog, NULL, tick_watchdog, NULL) == 0) {
+            pthread_detach(watchdog);
+        } else {
+            l_warn("Could not start startup/nativeTick watchdog thread.");
+        }
     }
+    configure_main_thread_affinity();
 
     int render_width = settings_render_width();
     int render_height = settings_render_height();
@@ -446,16 +594,42 @@ int main(void) {
            render_height, settings_low_graphics_applied() ? "ON" : "OFF");
     l_info("Calling nativeSurfaceCreated.");
     log_flush();
-    atomic_store_explicit(&native_surface_started_us,
-                          sceKernelGetProcessTimeWide(), memory_order_relaxed);
-    atomic_store_explicit(&native_surface_active, true, memory_order_release);
+    if (runtime_diagnostics_enabled) {
+        atomic_store_explicit(&native_surface_started_us,
+                              sceKernelGetProcessTimeWide(),
+                              memory_order_relaxed);
+        atomic_store_explicit(&native_surface_active, true,
+                              memory_order_release);
+    }
     native_surface_created(&jni, NULL, NULL, render_width, render_height);
-    atomic_store_explicit(&native_surface_active, false, memory_order_release);
+    if (runtime_diagnostics_enabled) {
+        atomic_store_explicit(&native_surface_active, false,
+                              memory_order_release);
+    }
     l_success("nativeSurfaceCreated returned.");
+
+    l_info("Calling nativeResize.");
+    log_flush();
     native_resize(&jni, NULL, render_width, render_height);
+    l_success("nativeResize returned.");
+
+    l_info("Calling nativeOrientationChanged.");
+    log_flush();
     native_orientation_changed(&jni, NULL, ANDROID_SURFACE_ROTATION_90);
+    l_success("nativeOrientationChanged returned.");
+
+    l_info("Calling nativeGainedAudioFocus.");
+    log_flush();
     native_gained_audio_focus(&jni, NULL);
+    l_success("nativeGainedAudioFocus returned.");
+
+    l_info("Calling nativeResume.");
+    log_flush();
     native_resume(&jni, NULL);
+    l_success("nativeResume returned.");
+
+    start_profile_sync_worker();
+    controls_start_touch_sampler();
     l_info("Audio port state after lifecycle setup: MAIN=%d BGM=%d.",
            sceAudioOutGetAdopt(SCE_AUDIO_OUT_PORT_TYPE_MAIN),
            sceAudioOutGetAdopt(SCE_AUDIO_OUT_PORT_TYPE_BGM));
@@ -463,18 +637,33 @@ int main(void) {
     log_flush();
 
     uint64_t ticks = 0;
-    uint64_t last_heartbeat = sceKernelGetProcessTimeWide();
+#ifdef BTD5_PERIODIC_TELEMETRY
+    const bool telemetry_enabled = log_is_enabled();
+    uint64_t last_heartbeat = telemetry_enabled ?
+        sceKernelGetProcessTimeWide() : 0;
     uint64_t timing_samples = 0;
     uint64_t timing_total_us = 0;
     uint64_t timing_max_us = 0;
     uint32_t timing_over_33ms = 0;
     uint32_t timing_over_50ms = 0;
     uint32_t timing_over_100ms = 0;
+#endif
     bool lifecycle_paused = false;
+#ifdef BTD5_NATIVE_PHASE_PROFILER
+    const bool phase_profiler_enabled =
+        btd5_native_phase_profiler_enabled();
+    uint64_t previous_tick_us = 0;
+#endif
+    bool tick_timing_enabled = runtime_diagnostics_enabled;
+#ifdef BTD5_PERIODIC_TELEMETRY
+    tick_timing_enabled = tick_timing_enabled || telemetry_enabled;
+#endif
+#ifdef BTD5_NATIVE_PHASE_PROFILER
+    tick_timing_enabled = tick_timing_enabled || phase_profiler_enabled;
+#endif
     while (1) {
         lifecycle_paused = update_lifecycle(lifecycle_paused);
         if (lifecycle_paused) {
-            sync_profile_storage(false, "completed game save");
             sceKernelDelayThread(16 * 1000);
             continue;
         }
@@ -483,43 +672,79 @@ int main(void) {
                                      memory_order_acq_rel)) {
             perform_clean_exit();
         }
-        uint64_t started = atomic_fetch_add_explicit(&native_ticks_started, 1,
-                                                     memory_order_relaxed) + 1;
-        uint64_t tick_started_us = sceKernelGetProcessTimeWide();
-        atomic_store_explicit(&native_tick_started_us,
-                              tick_started_us,
-                              memory_order_relaxed);
-        atomic_store_explicit(&native_tick_active, true, memory_order_release);
+        uint64_t started = ticks + 1;
+        uint64_t tick_started_us = tick_timing_enabled ?
+            sceKernelGetProcessTimeWide() : 0;
+        if (runtime_diagnostics_enabled) {
+            atomic_fetch_add_explicit(&native_ticks_started, 1,
+                                      memory_order_relaxed);
+            atomic_store_explicit(&native_tick_started_us,
+                                  tick_started_us,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&native_tick_active, true,
+                                  memory_order_release);
+        }
         if (started == 1) {
             l_info("Entering first nativeTick call.");
             log_flush();
         }
-        btd5_diag_set_stage(BTD5_STAGE_TICK_ENTER);
-        native_tick(&jni, NULL);
-        btd5_diag_set_stage(BTD5_STAGE_TICK_RETURNED);
-        uint64_t tick_elapsed_us = sceKernelGetProcessTimeWide() -
-                                   tick_started_us;
-        atomic_store_explicit(&native_tick_active, false, memory_order_release);
-        atomic_fetch_add_explicit(&native_ticks_completed, 1,
-                                  memory_order_relaxed);
-        ticks++;
-        timing_samples++;
-        timing_total_us += tick_elapsed_us;
-        if (tick_elapsed_us > timing_max_us) {
-            timing_max_us = tick_elapsed_us;
+        if (runtime_diagnostics_enabled) {
+            btd5_diag_set_stage(BTD5_STAGE_TICK_ENTER);
         }
-        if (tick_elapsed_us >= 33333ULL) timing_over_33ms++;
-        if (tick_elapsed_us >= 50000ULL) timing_over_50ms++;
-        if (tick_elapsed_us >= 100000ULL) timing_over_100ms++;
+#ifdef BTD5_NATIVE_PHASE_PROFILER
+        if (phase_profiler_enabled) {
+            btd5_native_phase_probe_begin(started, previous_tick_us);
+        }
+#endif
+        native_tick(&jni, NULL);
+#ifdef BTD5_NATIVE_PHASE_PROFILER
+        if (phase_profiler_enabled) {
+            btd5_native_phase_probe_end();
+        }
+#endif
+        if (runtime_diagnostics_enabled) {
+            btd5_diag_set_stage(BTD5_STAGE_TICK_RETURNED);
+        }
+#if defined(BTD5_PERIODIC_TELEMETRY) || defined(BTD5_NATIVE_PHASE_PROFILER)
+        uint64_t tick_elapsed_us = tick_timing_enabled ?
+            sceKernelGetProcessTimeWide() - tick_started_us : 0;
+#endif
+        if (runtime_diagnostics_enabled) {
+            atomic_store_explicit(&native_tick_active, false,
+                                  memory_order_release);
+            atomic_fetch_add_explicit(&native_ticks_completed, 1,
+                                      memory_order_relaxed);
+        }
+        ticks++;
+#ifdef BTD5_PERIODIC_TELEMETRY
+        if (telemetry_enabled) {
+            timing_samples++;
+            timing_total_us += tick_elapsed_us;
+            if (tick_elapsed_us > timing_max_us) {
+                timing_max_us = tick_elapsed_us;
+            }
+            if (tick_elapsed_us >= 33333ULL) timing_over_33ms++;
+            if (tick_elapsed_us >= 50000ULL) timing_over_50ms++;
+            if (tick_elapsed_us >= 100000ULL) timing_over_100ms++;
+        }
+#endif
+#ifdef BTD5_NATIVE_PHASE_PROFILER
+        if (phase_profiler_enabled) {
+            previous_tick_us = tick_elapsed_us;
+        }
+#endif
 
-        sync_profile_storage(false, "completed game save");
+        if (!profile_sync_worker_available) {
+            sync_profile_storage(false, "synchronous fallback save");
+        }
 
         if (ticks == 1) {
             l_success("First nativeTick call returned.");
             log_flush();
         }
 
-        if (ticks % 60 == 0) {
+#ifdef BTD5_PERIODIC_TELEMETRY
+        if (telemetry_enabled && ticks % 60 == 0) {
             uint64_t now = sceKernelGetProcessTimeWide();
             if (now - last_heartbeat >= 10ULL * 1000ULL * 1000ULL) {
                 l_info("Tick loop alive: %llu calls.",
@@ -530,6 +755,8 @@ int main(void) {
                     timing_total_us / timing_samples : 0;
                 uint64_t swap_average_us = swap_stats.samples != 0 ?
                     swap_stats.total_us / swap_stats.samples : 0;
+                uint32_t frame_debt_clamps =
+                    btd5_take_frame_debt_clamp_count();
                 l_info("Frame timing: nativeTick avg=%llu.%01llu ms, "
                        "max=%llu.%01llu ms, >=33/50/100ms=%u/%u/%u "
                        "(%llu frames); EGL swap avg=%llu.%01llu ms, "
@@ -550,6 +777,131 @@ int main(void) {
                        (unsigned long long)((swap_stats.max_us % 1000ULL) /
                                             100ULL),
                        (unsigned long long)swap_stats.samples);
+                l_info("Frame-debt protection: clamped %u overloaded frame "
+                       "delta values during this interval.",
+                       frame_debt_clamps);
+                BTD5NativePhaseStats phase_stats = {0};
+                btd5_take_native_phase_stats(&phase_stats);
+                if (phase_stats.sampled_ticks != 0) {
+                    uint64_t measured_us = phase_stats.pre_engine_total_us +
+                                           phase_stats.engine_total_us;
+                    uint64_t post_engine_total_us =
+                        phase_stats.sampled_tick_total_us > measured_us ?
+                        phase_stats.sampled_tick_total_us - measured_us : 0;
+                    uint64_t total_avg_us = phase_stats.sampled_tick_total_us /
+                                            phase_stats.sampled_ticks;
+                    uint64_t pre_engine_avg_us = phase_stats.pre_engine_samples ?
+                        phase_stats.pre_engine_total_us /
+                        phase_stats.pre_engine_samples : 0;
+                    uint64_t engine_avg_us = phase_stats.engine_samples ?
+                        phase_stats.engine_total_us /
+                        phase_stats.engine_samples : 0;
+                    uint64_t inner_update_avg_us =
+                        phase_stats.inner_update_samples ?
+                        phase_stats.inner_update_total_us /
+                        phase_stats.inner_update_samples : 0;
+                    uint64_t outer_exclusive_total_us =
+                        phase_stats.engine_total_us >
+                            phase_stats.inner_update_total_us ?
+                        phase_stats.engine_total_us -
+                            phase_stats.inner_update_total_us : 0;
+                    uint64_t outer_exclusive_avg_us =
+                        phase_stats.engine_samples ?
+                        outer_exclusive_total_us /
+                            phase_stats.engine_samples : 0;
+                    uint64_t post_engine_avg_us = post_engine_total_us /
+                                                  phase_stats.sampled_ticks;
+                    unsigned int engine_target_offset = 0xffffffffu;
+                    if (phase_stats.engine_samples != 0 &&
+                        phase_stats.engine_target >= so_mod.text_base &&
+                        phase_stats.engine_target <
+                            so_mod.text_base + so_mod.exec_size) {
+                        engine_target_offset = (unsigned int)(
+                            phase_stats.engine_target - so_mod.text_base);
+                    }
+                    unsigned int inner_update_target_offset = 0xffffffffu;
+                    if (phase_stats.inner_update_samples != 0 &&
+                        phase_stats.inner_update_target >= so_mod.text_base &&
+                        phase_stats.inner_update_target <
+                            so_mod.text_base + so_mod.exec_size) {
+                        inner_update_target_offset = (unsigned int)(
+                            phase_stats.inner_update_target - so_mod.text_base);
+                    }
+                    l_info("Native engine samples: ticks=%llu "
+                           "(periodic=%llu slow=%llu), total avg=%llu.%01llu "
+                           "ms max=%llu.%01llu; pre-engine avg=%llu.%01llu "
+                           "max=%llu.%01llu (%llu); engine@SO+0x%08x "
+                           "avg=%llu.%01llu max=%llu.%01llu "
+                           "(%llu, target_changes=%llu); post-engine/residual "
+                           "avg=%llu.%01llu ms.",
+                           (unsigned long long)phase_stats.sampled_ticks,
+                           (unsigned long long)phase_stats.periodic_samples,
+                           (unsigned long long)phase_stats.slow_triggered_samples,
+                           (unsigned long long)(total_avg_us / 1000ULL),
+                           (unsigned long long)((total_avg_us % 1000ULL) / 100ULL),
+                           (unsigned long long)(phase_stats.sampled_tick_max_us /
+                                                1000ULL),
+                           (unsigned long long)((phase_stats.sampled_tick_max_us %
+                                                1000ULL) / 100ULL),
+                           (unsigned long long)(pre_engine_avg_us / 1000ULL),
+                           (unsigned long long)((pre_engine_avg_us % 1000ULL) /
+                                                100ULL),
+                           (unsigned long long)(phase_stats.pre_engine_max_us /
+                                                1000ULL),
+                           (unsigned long long)((phase_stats.pre_engine_max_us %
+                                                1000ULL) / 100ULL),
+                           (unsigned long long)phase_stats.pre_engine_samples,
+                           engine_target_offset,
+                           (unsigned long long)(engine_avg_us / 1000ULL),
+                           (unsigned long long)((engine_avg_us % 1000ULL) /
+                                                100ULL),
+                           (unsigned long long)(phase_stats.engine_max_us /
+                                                1000ULL),
+                           (unsigned long long)((phase_stats.engine_max_us %
+                                                1000ULL) / 100ULL),
+                           (unsigned long long)phase_stats.engine_samples,
+                           (unsigned long long)phase_stats.engine_target_changes,
+                           (unsigned long long)(post_engine_avg_us / 1000ULL),
+                           (unsigned long long)((post_engine_avg_us % 1000ULL) /
+                                                100ULL));
+                    l_info("Nested engine update: inner@SO+0x%08x "
+                           "avg=%llu.%01llu ms max=%llu.%01llu "
+                           "(%llu samples, target_changes=%llu); outer "
+                           "exclusive/residual avg=%llu.%01llu ms.",
+                           inner_update_target_offset,
+                           (unsigned long long)(inner_update_avg_us / 1000ULL),
+                           (unsigned long long)((inner_update_avg_us % 1000ULL) /
+                                                100ULL),
+                           (unsigned long long)(phase_stats.inner_update_max_us /
+                                                1000ULL),
+                           (unsigned long long)((phase_stats.inner_update_max_us %
+                                                1000ULL) / 100ULL),
+                           (unsigned long long)phase_stats.inner_update_samples,
+                           (unsigned long long)
+                               phase_stats.inner_update_target_changes,
+                           (unsigned long long)(outer_exclusive_avg_us / 1000ULL),
+                           (unsigned long long)((outer_exclusive_avg_us % 1000ULL) /
+                                                100ULL));
+                    uint64_t sampled_draw_avg_us = phase_stats.gl_draw_calls ?
+                        phase_stats.gl_draw_cpu_us /
+                        phase_stats.gl_draw_calls : 0;
+                    l_info("Sampled GL inside nativeTick: calls=%llu, "
+                           "vertices=%llu, draw CPU total=%llu.%01llu ms, "
+                           "avg=%llu us/call, max=%llu.%01llu ms. This is "
+                           "nested inside the sampled engine/frame phases, "
+                           "not additional frame time.",
+                           (unsigned long long)phase_stats.gl_draw_calls,
+                           (unsigned long long)phase_stats.gl_draw_vertices,
+                           (unsigned long long)(phase_stats.gl_draw_cpu_us /
+                                                1000ULL),
+                           (unsigned long long)((phase_stats.gl_draw_cpu_us %
+                                                1000ULL) / 100ULL),
+                           (unsigned long long)sampled_draw_avg_us,
+                           (unsigned long long)(phase_stats.gl_draw_cpu_max_us /
+                                                1000ULL),
+                           (unsigned long long)((phase_stats.gl_draw_cpu_max_us %
+                                                1000ULL) / 100ULL));
+                }
                 GLDrawStats draw_stats = {0};
                 gl_take_draw_stats(&draw_stats);
                 l_info("GL draw load: arrays=%llu (%llu vertices), "
@@ -557,6 +909,35 @@ int main(void) {
                        draw_stats.array_calls, draw_stats.array_vertices,
                        draw_stats.element_calls, draw_stats.element_indices,
                        (unsigned long long)timing_samples);
+                unsigned long long cache_percent = draw_stats.state_calls != 0 ?
+                    draw_stats.state_skipped * 100ULL /
+                    draw_stats.state_calls : 0;
+                if (draw_stats.detailed_timing) {
+                    unsigned long long draw_calls = draw_stats.array_calls +
+                                                    draw_stats.element_calls;
+                    unsigned long long draw_average_us = draw_calls != 0 ?
+                        draw_stats.draw_cpu_us / draw_calls : 0;
+                    l_info("GL submit timing: draw CPU total=%llu.%01llu ms, "
+                           "avg=%llu us/call, max=%llu.%01llu ms, "
+                           ">=1/4ms=%llu/%llu; state cache skipped=%llu/%llu "
+                           "(%llu%%).",
+                           draw_stats.draw_cpu_us / 1000ULL,
+                           (draw_stats.draw_cpu_us % 1000ULL) / 100ULL,
+                           draw_average_us,
+                           draw_stats.draw_cpu_max_us / 1000ULL,
+                           (draw_stats.draw_cpu_max_us % 1000ULL) / 100ULL,
+                           draw_stats.draw_over_1ms,
+                           draw_stats.draw_over_4ms,
+                           draw_stats.state_skipped,
+                           draw_stats.state_calls,
+                           cache_percent);
+                } else {
+                    l_info("GL release telemetry: per-draw timers disabled; "
+                           "state cache skipped=%llu/%llu (%llu%%).",
+                           draw_stats.state_skipped,
+                           draw_stats.state_calls,
+                           cache_percent);
+                }
                 log_effects_status();
                 log_flush();
                 timing_samples = 0;
@@ -568,6 +949,7 @@ int main(void) {
                 last_heartbeat = now;
             }
         }
+#endif
     }
 
     return sceKernelExitDeleteThread(0);

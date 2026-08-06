@@ -1,6 +1,8 @@
 #ifndef BTD5_DIAGNOSTICS_H
 #define BTD5_DIAGNOSTICS_H
 
+#include <stdbool.h>
+
 typedef enum BTD5TickStage {
     BTD5_STAGE_BOOT = 0,
     BTD5_STAGE_TICK_ENTER,
@@ -23,6 +25,7 @@ typedef enum BTD5TickStage {
     BTD5_STAGE_TICK_RETURNED,
 } BTD5TickStage;
 
+void btd5_diag_set_enabled(bool enabled);
 void btd5_diag_bind_current_thread(void);
 int btd5_diag_is_current_thread(void);
 void btd5_diag_set_stage(BTD5TickStage stage);

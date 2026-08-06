@@ -60,6 +60,8 @@ int setenv_soloader(const char * name, const char * value, int overwrite);
 
 int getpagesize(void);
 
+long sysconf_soloader(int name);
+
 #ifdef __cplusplus
 };
 #endif

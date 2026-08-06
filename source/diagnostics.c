@@ -3,9 +3,14 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 
+static bool diagnostics_enabled = false;
 static atomic_int tick_stage = ATOMIC_VAR_INIT(BTD5_STAGE_BOOT);
 static atomic_bool tick_thread_bound = ATOMIC_VAR_INIT(false);
 static _Thread_local bool is_tick_thread = false;
+
+void btd5_diag_set_enabled(bool enabled) {
+    diagnostics_enabled = enabled;
+}
 
 void btd5_diag_bind_current_thread(void) {
     is_tick_thread = true;
@@ -17,6 +22,9 @@ int btd5_diag_is_current_thread(void) {
 }
 
 void btd5_diag_set_stage(BTD5TickStage stage) {
+    if (!diagnostics_enabled) {
+        return;
+    }
     if (atomic_load_explicit(&tick_thread_bound, memory_order_acquire) &&
         !is_tick_thread) {
         return;

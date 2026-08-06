@@ -14,6 +14,7 @@ CURRENT_LOG = """
 ℹ info     Patched ARM kuser helpers: 0 cmpxchg, 0 memory barriers.
 ℹ info     Tick loop alive: 6000 calls.
 ℹ info     Frame timing: nativeTick avg=40.0 ms, max=140.0 ms, >=33/50/100ms=80/20/3 (250 frames); EGL swap avg=10.0 ms, max=30.0 ms (250 swaps).
+ℹ info     Nested engine update: inner@SO+0x00345678 avg=30.0 ms max=95.0 ms (12 samples, target_changes=0); outer exclusive/residual avg=10.0 ms.
 ℹ info     GL draw load: arrays=2500 (10000 vertices), elements=5000 (30000 indices) over 250 frames.
 ℹ info     Effects audio: players=1 (failed=0), enqueues=5000 (failed=0), mixed=4000/5000 buffers, last=22050 Hz/2 ch/16-bit, completed=4999, delayed_start=0, output_error=0x00000000, resample alloc/reuse/grow=4/4992/4 (max=65536 bytes).
 ! success  Autosave checkpoint 12 committed (completed game save).
@@ -30,9 +31,14 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual(report.autosave_checkpoint, 12)
         self.assertEqual(report.audio[-1].reuses, 4992)
         self.assertEqual(report.draws[-1].element_calls, 5000)
+        self.assertEqual(report.nested_engine[-1].target_offset, 0x00345678)
+        self.assertEqual(report.nested_engine[-1].average_ms, 30.0)
         summary = "\n".join(analyzer.performance_summary(report))
         self.assertIn("game/audio CPU time outside EGL swap dominates", summary)
         self.assertIn("30.0 calls/frame", analyzer.draw_summary(report)[0])
+        nested = "\n".join(analyzer.nested_engine_summary(report))
+        self.assertIn("SO+0x00345678", nested)
+        self.assertIn("inner=75.0%", nested)
         output, ready = analyzer.format_report(report, "01.00")
         self.assertTrue(ready, output)
 

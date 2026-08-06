@@ -13,6 +13,8 @@
 #ifndef SOLOADER_LOGGER_H
 #define SOLOADER_LOGGER_H
 
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -57,6 +59,9 @@ void log_flush(void);
 
 /* Persist an already-formatted message without adding a loader prefix. */
 void log_write_raw(const char *message);
+
+/* True only for the VPK that packages loader_logging.cfg=1. */
+bool log_is_enabled(void);
 
 #ifdef __cplusplus
 };

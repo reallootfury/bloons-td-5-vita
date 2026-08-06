@@ -19,6 +19,7 @@
 #include <dirent.h>
 #include <stdarg.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/processmgr.h>
 
 #ifdef USE_SCELIBC_IO
 #include <libc_bridge/libc_bridge.h>
@@ -38,6 +39,7 @@
 
 static atomic_uintptr_t profile_write_streams[PROFILE_WRITE_STREAM_SLOTS];
 static atomic_uint profile_generation = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t profile_last_closed_us = ATOMIC_VAR_INIT(0);
 
 static bool profile_mode_is_writable(const char *mode) {
     return mode && (strchr(mode, 'w') || strchr(mode, 'a') ||
@@ -83,6 +85,10 @@ static bool untrack_profile_write_stream(FILE *stream) {
 
 uint32_t profile_save_generation(void) {
     return atomic_load_explicit(&profile_generation, memory_order_acquire);
+}
+
+uint64_t profile_save_last_closed_us(void) {
+    return atomic_load_explicit(&profile_last_closed_us, memory_order_acquire);
 }
 
 FILE * fopen_soloader(const char * filename, const char * mode) {
@@ -216,6 +222,9 @@ int fclose_soloader(FILE * f) {
 #endif
 
     if (completed_profile_write && ret == 0) {
+        atomic_store_explicit(&profile_last_closed_us,
+                              sceKernelGetProcessTimeWide(),
+                              memory_order_relaxed);
         atomic_fetch_add_explicit(&profile_generation, 1,
                                   memory_order_release);
     }

@@ -1,0 +1,43 @@
+# Build products and downloaded build dependencies
+/build/
+/build-*/
+/cmake-build-*/
+/.deps-src/
+/.deps-softfp/
+/dist/
+/lib/libc_bridge/out/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.elf
+*.self
+*.sfo
+*.velf
+*.vpk
+
+# User-owned game data must never be committed
+/apk/
+/private/
+*.apk
+*.apks
+*.xapk
+*.obb
+*.so
+
+# Runtime data, test saves, logs, and crash dumps
+*.log
+*.psp2dmp
+*.psp2dmp.tmp
+*.save
+settings.bin
+/new save/
+/vita-test-profile-*/
+
+# Editor, operating-system, and Python cache files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]

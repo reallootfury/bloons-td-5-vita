@@ -95,6 +95,11 @@ void log_flush(void) {
     atomic_thread_fence(memory_order_seq_cst);
 }
 
+
+bool log_is_enabled(void) {
+    return atomic_load_explicit(&_log_file_enabled, memory_order_acquire);
+}
+
 void log_write_raw(const char *message) {
     if (!message ||
         !atomic_load_explicit(&_log_file_enabled, memory_order_acquire)) {

@@ -16,6 +16,7 @@
 #include <time.h>
 #include <psp2/kernel/clib.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/kernel/cpu.h>
 #include <stdatomic.h>
 
 #include "utils/utils.h"
@@ -28,12 +29,21 @@
 
 #define PTHR_MAX_OBJECTS 1024
 #define PTHR_MAX_THREADS 32
+#define BTD5_ANDROID_WORKER_STACK (256U * 1024U)
 
 extern so_module so_mod;
 
 static atomic_uintptr_t watched_cond = ATOMIC_VAR_INIT(0);
 static atomic_uint condition_poll_wakeups = ATOMIC_VAR_INIT(0);
 static atomic_uint android_threads_created = ATOMIC_VAR_INIT(0);
+static atomic_uint android_worker_affinity_count = ATOMIC_VAR_INIT(0);
+
+/* Let the Vita scheduler distribute Android-created workers over all three
+ * supported user cores. Hard-pinning the supplied late-game run to a single
+ * main core plus cores 1/2/3 for workers increased contention and stutter. */
+#define BTD5_ANDROID_WORKER_CPU_MASK SCE_KERNEL_CPU_MASK_USER_ALL
+static atomic_int android_worker_cpu_mask =
+    ATOMIC_VAR_INIT(BTD5_ANDROID_WORKER_CPU_MASK);
 static atomic_uint android_semaphores_created = ATOMIC_VAR_INIT(0);
 static atomic_int android_thread_ids[PTHR_MAX_THREADS];
 static atomic_uintptr_t android_thread_starts[PTHR_MAX_THREADS];
@@ -122,6 +132,13 @@ static const char *worker_sync_name(int op) {
     }
 }
 
+void pthr_set_android_worker_cpu_mask(int mask) {
+    if ((mask & SCE_KERNEL_CPU_MASK_USER_ALL) == 0) {
+        mask = BTD5_ANDROID_WORKER_CPU_MASK;
+    }
+    atomic_store_explicit(&android_worker_cpu_mask, mask, memory_order_release);
+}
+
 static void *pthread_start_trampoline(void *opaque) {
     PthrStartContext context = *(PthrStartContext *)opaque;
     free(opaque);
@@ -131,6 +148,23 @@ static void *pthread_start_trampoline(void *opaque) {
                                        &invoke);
 
     int thread_id = sceKernelGetThreadId();
+    int worker_cpu_mask = atomic_load_explicit(
+        &android_worker_cpu_mask, memory_order_acquire);
+    int affinity_result = sceKernelChangeThreadCpuAffinityMask(
+        thread_id, worker_cpu_mask);
+    unsigned int affinity_sequence = atomic_fetch_add_explicit(
+        &android_worker_affinity_count, 1, memory_order_relaxed) + 1;
+    if (affinity_sequence <= 16 || affinity_result < 0) {
+        if (affinity_result < 0) {
+            l_warn("Could not assign Android worker 0x%x to CPU mask "
+                   "0x%08x: 0x%08x.", thread_id,
+                   (unsigned int)worker_cpu_mask,
+                   (unsigned int)affinity_result);
+        } else {
+            l_info("Android worker 0x%x assigned to CPU mask 0x%08x.",
+                   thread_id, (unsigned int)worker_cpu_mask);
+        }
+    }
     int slot = -1;
     for (int i = 0; i < PTHR_MAX_THREADS; ++i) {
         int empty = 0;
@@ -359,6 +393,7 @@ int forgetObject(const void * mut) {
 PTHR_INLINE int _attr_t_static_init(pthread_attr_t_bionic * attr) {
     if (attr->magic != 0x42424242) {
         attr->magic = 0x42424242;
+        attr->stack_size = 0;
         attr->real_ptr = malloc(sizeof(pthread_attr_t));
         return pthread_attr_init(attr->real_ptr);
     }
@@ -480,16 +515,25 @@ int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr
     context->start = start;
     context->param = param;
 
+    size_t effective_stack_size = BTD5_ANDROID_WORKER_STACK;
     if (!attr) {
         pthread_attr_t a;
         pthread_attr_init(&a);
-        pthread_attr_setstacksize(&a, 512 * 1024);
+        pthread_attr_setstacksize(&a, effective_stack_size);
         ret = pthread_create(thread, &a, pthread_start_trampoline, context);
         pthread_attr_destroy(&a);
-    } else{
-        _attr_t_static_init((pthread_attr_t_bionic *) attr);
-        pthread_attr_setstacksize(attr->real_ptr, 512 * 1024);
-        ret = pthread_create(thread, attr->real_ptr,
+    } else {
+        pthread_attr_t_bionic *mutable_attr = (pthread_attr_t_bionic *)attr;
+        _attr_t_static_init(mutable_attr);
+        /* BTD5 normally leaves the Android attribute at its default. Use a
+         * smaller safe default there, but never shrink an explicit request
+         * larger than 256 KiB. */
+        if (mutable_attr->stack_size > effective_stack_size) {
+            effective_stack_size = mutable_attr->stack_size;
+        }
+        pthread_attr_setstacksize(mutable_attr->real_ptr,
+                                  effective_stack_size);
+        ret = pthread_create(thread, mutable_attr->real_ptr,
                              pthread_start_trampoline, context);
     }
 
@@ -500,8 +544,9 @@ int pthread_create_soloader(pthread_t *thread, const pthread_attr_t_bionic *attr
     unsigned int sequence = atomic_fetch_add_explicit(
         &android_threads_created, 1, memory_order_relaxed) + 1;
     if (sequence <= 16 || ret != 0) {
-        l_info("Android pthread_create #%u: start SO+0x%08x, result %d.",
-               sequence, game_address_offset((void *)start), ret);
+        l_info("Android pthread_create #%u: start SO+0x%08x, stack=%u KiB, "
+               "result %d.", sequence, game_address_offset((void *)start),
+               (unsigned int)(effective_stack_size / 1024U), ret);
     }
 
     return ret;
@@ -733,14 +778,14 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
     bool watched = cond_wait_watch_begin(cond, mutex, caller, false);
     btd5_diag_set_stage(BTD5_STAGE_COND_WAIT);
 
-    /* pthreads-embedded occasionally loses a broadcast after this Boost
-     * worker barrier has cycled a few hundred times.  POSIX condition waits
-     * explicitly permit spurious wakeups, and Boost rechecks the barrier's
-     * generation under the mutex.  Use a bounded native wait so a lost
-     * semaphore wake cannot freeze the render thread forever. */
+    /* pthreads-embedded occasionally loses a broadcast at BTD5 4.7's
+     * Boost startup barrier. Only that fingerprinted call site needs a bounded
+     * wait. Applying a 250 ms timeout to every game condition causes otherwise
+     * idle workers to wake and churn during gameplay. */
     struct timespec deadline;
     int ret;
-    if (clock_gettime(CLOCK_REALTIME, &deadline) == 0) {
+    if (caller_offset == 0x004dd815u &&
+        clock_gettime(CLOCK_REALTIME, &deadline) == 0) {
         deadline.tv_nsec += 250 * 1000 * 1000L;
         if (deadline.tv_nsec >= 1000 * 1000 * 1000L) {
             deadline.tv_sec++;
@@ -754,8 +799,8 @@ int pthread_cond_wait_soloader(pthread_cond_t_bionic *cond, pthread_mutex_t_bion
             unsigned int count = atomic_fetch_add_explicit(
                 &condition_poll_wakeups, 1, memory_order_relaxed) + 1;
             if (count <= 5 || count % 20 == 0) {
-                l_warn("Recovered condition wait at SO+0x%08x with a "
-                       "POSIX spurious wake (poll #%u).",
+                l_warn("Recovered BTD5 startup barrier wait at SO+0x%08x "
+                       "with a POSIX spurious wake (poll #%u).",
                        game_address_offset(caller), count);
             }
             ret = 0;
@@ -816,7 +861,9 @@ int pthread_attr_destroy_soloader(pthread_attr_t_bionic *attr)
 
     int ret = pthread_attr_destroy(attr->real_ptr);
     free(attr->real_ptr);
+    attr->real_ptr = NULL;
     attr->magic = 0x0;
+    attr->stack_size = 0;
 
     return ret;
 }
@@ -832,7 +879,11 @@ int pthread_attr_setdetachstate_soloader(pthread_attr_t_bionic *attr, int state)
 int pthread_attr_setstacksize_soloader(pthread_attr_t_bionic *attr, size_t stacksize) {
     if (!attr) return -1;
     _attr_t_static_init(attr);
-    return pthread_attr_setstacksize(attr->real_ptr, stacksize);
+    int ret = pthread_attr_setstacksize(attr->real_ptr, stacksize);
+    if (ret == 0) {
+        attr->stack_size = stacksize;
+    }
+    return ret;
 }
 
 int pthread_setschedparam_soloader(pthread_t thread, int policy,

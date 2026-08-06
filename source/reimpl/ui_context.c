@@ -598,7 +598,9 @@ static bool placement_touch_continues(UiContext old_context,
     bool old_placement = contains_fold(old_name, "TowerPlacementScreen");
     bool new_placement = contains_fold(new_name, "TowerPlacementScreen");
 
-
+    /* DOWN on a tower/spike opens TowerPlacementScreen, and the matching UP
+     * returns to InGameBorders. Both changes belong to the same Android touch
+     * gesture and must not synthesize ACTION_CANCEL. */
     return (old_borders && new_placement) ||
            (old_placement && new_borders);
 }
@@ -641,6 +643,16 @@ UiContext ui_context_current(void) {
 
 bool ui_context_touch_cancel_required(void) {
     return ui_context.touch_cancel_required;
+}
+
+bool ui_context_is_ingame_borders(void) {
+    return ui_context.context == UI_CONTEXT_GAME &&
+           contains_fold(ui_context.screen_name, "InGameBorders");
+}
+
+bool ui_context_is_tower_placement(void) {
+    return ui_context.context == UI_CONTEXT_GAME &&
+           contains_fold(ui_context.screen_name, "TowerPlacementScreen");
 }
 
 const char *ui_context_name(UiContext context) {

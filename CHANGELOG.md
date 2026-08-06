@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.01
+
+- Reworked front-touch input delivery to preserve rapid taps, drags, releases, and tower or special-placement gestures.
+- Improved placement-drag handling so touch release events are delivered in order instead of closing the selected tower or special prematurely.
+- Reduced non-logging build overhead by disabling persistent diagnostics, profiler hooks, watchdog polling, and per-frame timing work.
+- Added conservative OpenGL ES vertex-attribute state caching to avoid redundant glVertexAttribPointer setup.
+- Added fingerprint-gated frame-debt protection for unusually large native update deltas.
+- Removed unnecessary glFinish and glFlush diagnostic overhead from the standard VPK.
+- Kept detailed runtime diagnostics limited to the separate logging VPK.
+
+
 ## v1.00 — 2026-07-18
 
 First public release.
