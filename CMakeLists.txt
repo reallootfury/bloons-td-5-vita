@@ -54,6 +54,11 @@ add_definitions(-DDATA_PATH="${DATA_PATH}" -DSO_PATH="${SO_PATH}")
 
 option(BTD5_NATIVE_PHASE_PROFILER
        "Compile the BTD5 4.7 native phase profiler; it installs only when loader logging is enabled" ON)
+option(BTD5_OFFLINE_NET
+       "Refuse socket/DNS calls so the declared offline posture holds on hardware" ON)
+if (BTD5_OFFLINE_NET)
+  add_definitions(-DBTD5_OFFLINE_NET)
+endif()
 option(BTD5_FRAME_DEBT_CLAMP
        "Cap severe BTD5 4.7 frame debt at 33.33 ms before the active update" ON)
 option(BTD5_RELEASE_TELEMETRY
@@ -156,6 +161,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/reimpl/io.c
                source/reimpl/jmp.c
                source/reimpl/log.c
+               source/reimpl/net_offline.c
                source/reimpl/mem.c
                source/reimpl/pthr.c
                source/reimpl/sys.c
