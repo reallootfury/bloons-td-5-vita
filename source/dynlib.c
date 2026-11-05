@@ -59,10 +59,11 @@
 #include "reimpl/bionic.h"
 #include "reimpl/window.h"
 #include "reimpl/net_offline.h"
+#include "reimpl/net_inet.h"
 
 /* Offline posture (a): every socket-family and resolver import is served by
  * reimpl/net_offline.c, so no SceNet function is imported, unless built with
- * -DBTD5_OFFLINE_NET=OFF. inet_* string conversions stay as-is. */
+ * -DBTD5_OFFLINE_NET=OFF. inet_* conversions are pure C (reimpl/net_inet.c). */
 #ifdef BTD5_OFFLINE_NET
 #define BTD5_NET(name) (uintptr_t)&name##_offline
 #else
@@ -424,10 +425,10 @@ so_default_dynlib default_dynlib[] = {
         { "getservbyname", BTD5_NET(getservbyname) },
         { "getsockname", BTD5_NET(getsockname) },
         { "getsockopt", BTD5_NET(getsockopt) },
-        { "inet_aton", (uintptr_t)&inet_aton },
-        { "inet_pton", (uintptr_t)&inet_pton },
-        { "inet_ntoa", (uintptr_t)&inet_ntoa },
-        { "inet_ntop", (uintptr_t)&inet_ntop },
+        { "inet_aton", BTD5_NET(inet_aton) },
+        { "inet_pton", BTD5_NET(inet_pton) },
+        { "inet_ntoa", BTD5_NET(inet_ntoa) },
+        { "inet_ntop", BTD5_NET(inet_ntop) },
         { "listen", BTD5_NET(listen) },
         { "poll", BTD5_NET(poll) },
         { "recv", BTD5_NET(recv) },

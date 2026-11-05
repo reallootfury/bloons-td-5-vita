@@ -161,6 +161,7 @@ add_executable(${CMAKE_PROJECT_NAME}
                source/reimpl/io.c
                source/reimpl/jmp.c
                source/reimpl/log.c
+               source/reimpl/net_inet.c
                source/reimpl/net_offline.c
                source/reimpl/mem.c
                source/reimpl/pthr.c
