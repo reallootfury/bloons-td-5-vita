@@ -58,6 +58,17 @@
 #include "reimpl/asset_manager.h"
 #include "reimpl/bionic.h"
 #include "reimpl/window.h"
+#include "reimpl/net_offline.h"
+#include "reimpl/net_inet.h"
+
+/* Offline posture (a): every socket-family and resolver import is served by
+ * reimpl/net_offline.c, so no SceNet function is imported, unless built with
+ * -DBTD5_OFFLINE_NET=OFF. inet_* conversions are pure C (reimpl/net_inet.c). */
+#ifdef BTD5_OFFLINE_NET
+#define BTD5_NET(name) (uintptr_t)&name##_offline
+#else
+#define BTD5_NET(name) (uintptr_t)&name
+#endif
 
 extern int bionic_setjmp(void *env);
 extern void bionic_longjmp(void *env, int value);
@@ -401,35 +412,35 @@ so_default_dynlib default_dynlib[] = {
 
 
         // Sockets
-        { "accept", (uintptr_t)&accept },
-        { "bind", (uintptr_t)&bind },
-        { "connect", (uintptr_t)&connect },
-        { "freeaddrinfo", (uintptr_t)&freeaddrinfo },
+        { "accept", BTD5_NET(accept) },
+        { "bind", BTD5_NET(bind) },
+        { "connect", BTD5_NET(connect) },
+        { "freeaddrinfo", BTD5_NET(freeaddrinfo) },
         { "gai_strerror", (uintptr_t)&ret0 },
-        { "getaddrinfo", (uintptr_t)&getaddrinfo },
-        { "gethostbyaddr", (uintptr_t)&gethostbyaddr },
-        { "gethostbyname", (uintptr_t)&gethostbyname },
-        { "gethostname", (uintptr_t)&gethostname },
-        { "getpeername", (uintptr_t)&getpeername },
-        { "getservbyname", (uintptr_t)&getservbyname },
-        { "getsockname", (uintptr_t)&getsockname },
-        { "getsockopt", (uintptr_t)&getsockopt },
-        { "inet_aton", (uintptr_t)&inet_aton },
-        { "inet_pton", (uintptr_t)&inet_pton },
-        { "inet_ntoa", (uintptr_t)&inet_ntoa },
-        { "inet_ntop", (uintptr_t)&inet_ntop },
-        { "listen", (uintptr_t)&listen },
-        { "poll", (uintptr_t)&poll },
-        { "recv", (uintptr_t)&recv },
-        { "recvfrom", (uintptr_t)&recvfrom },
-        { "recvmsg", (uintptr_t)&recvmsg },
-        { "select", (uintptr_t)&select },
-        { "send", (uintptr_t)&send },
-        { "sendmsg", (uintptr_t)&sendmsg },
-        { "sendto", (uintptr_t)&sendto },
-        { "setsockopt", (uintptr_t)&setsockopt },
-        { "shutdown", (uintptr_t)&shutdown },
-        { "socket", (uintptr_t)&socket },
+        { "getaddrinfo", BTD5_NET(getaddrinfo) },
+        { "gethostbyaddr", BTD5_NET(gethostbyaddr) },
+        { "gethostbyname", BTD5_NET(gethostbyname) },
+        { "gethostname", BTD5_NET(gethostname) },
+        { "getpeername", BTD5_NET(getpeername) },
+        { "getservbyname", BTD5_NET(getservbyname) },
+        { "getsockname", BTD5_NET(getsockname) },
+        { "getsockopt", BTD5_NET(getsockopt) },
+        { "inet_aton", BTD5_NET(inet_aton) },
+        { "inet_pton", BTD5_NET(inet_pton) },
+        { "inet_ntoa", BTD5_NET(inet_ntoa) },
+        { "inet_ntop", BTD5_NET(inet_ntop) },
+        { "listen", BTD5_NET(listen) },
+        { "poll", BTD5_NET(poll) },
+        { "recv", BTD5_NET(recv) },
+        { "recvfrom", BTD5_NET(recvfrom) },
+        { "recvmsg", BTD5_NET(recvmsg) },
+        { "select", BTD5_NET(select) },
+        { "send", BTD5_NET(send) },
+        { "sendmsg", BTD5_NET(sendmsg) },
+        { "sendto", BTD5_NET(sendto) },
+        { "setsockopt", BTD5_NET(setsockopt) },
+        { "shutdown", BTD5_NET(shutdown) },
+        { "socket", BTD5_NET(socket) },
 
 
         // Memory
